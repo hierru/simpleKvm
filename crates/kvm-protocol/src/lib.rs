@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use std::str::FromStr;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_PORT: u16 = 24800;
 
 /// Upper bound on a single frame; input events are tiny, this only guards
@@ -74,6 +74,9 @@ pub enum Message {
     /// Client -> server: the cursor hit the client's return edge.
     ReturnToServer { y_ratio: f32 },
 
+    /// Either direction: the sender's clipboard text changed. Text-only for now.
+    Clipboard { text: String },
+
     Heartbeat,
 }
 
@@ -100,6 +103,61 @@ pub fn read_message(r: &mut impl Read) -> io::Result<Message> {
     bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// Clipboard sync helper shared by both ends. Suppresses echo by remembering the
+/// last text seen, whether it came from the local OS or the remote peer.
+#[cfg(feature = "clipboard")]
+pub mod clipboard {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    pub struct ClipboardState {
+        last: Arc<Mutex<Option<String>>>,
+    }
+
+    impl ClipboardState {
+        /// Seed `last` with the current OS clipboard so a freshly-connected peer
+        /// isn't immediately sent (and doesn't swap) the pre-existing contents.
+        pub fn primed() -> Self {
+            let state = Self::default();
+            if let Some(text) = read_os_clipboard() {
+                *state.last.lock().unwrap() = Some(text);
+            }
+            state
+        }
+
+        /// Apply text received from the peer to the OS clipboard, recording it so
+        /// the local poller won't echo it straight back.
+        pub fn apply_remote(&self, text: String) {
+            {
+                let mut last = self.last.lock().unwrap();
+                if last.as_deref() == Some(text.as_str()) {
+                    return;
+                }
+                *last = Some(text.clone());
+            }
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                let _ = cb.set_text(text);
+            }
+        }
+
+        /// If the OS clipboard changed locally, return the new text to send to the
+        /// peer (and record it). Returns None when unchanged or unreadable.
+        pub fn poll_local_change(&self) -> Option<String> {
+            let cur = read_os_clipboard()?;
+            let mut last = self.last.lock().unwrap();
+            if last.as_deref() == Some(cur.as_str()) {
+                return None;
+            }
+            *last = Some(cur.clone());
+            Some(cur)
+        }
+    }
+
+    fn read_os_clipboard() -> Option<String> {
+        arboard::Clipboard::new().ok()?.get_text().ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +170,7 @@ mod tests {
             Message::MouseMove { dx: -3, dy: 17 },
             Message::Key { vk: 0x41, pressed: true },
             Message::ReturnToServer { y_ratio: 1.0 },
+            Message::Clipboard { text: "hello 클립보드".into() },
         ];
         let mut buf = Vec::new();
         for m in &msgs {

@@ -10,10 +10,33 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use eframe::egui;
+use kvm_protocol::clipboard::ClipboardState;
 use kvm_protocol::{read_message, write_message, Message, PROTOCOL_VERSION};
 
 use crate::config::ClientConfig;
 use crate::inject::Injector;
+
+/// Poll the OS clipboard and forward local changes to the server. Exits when the
+/// connection dies (`alive` cleared) or the worker stops.
+fn clipboard_loop(
+    clip: ClipboardState,
+    writer: Arc<Mutex<TcpStream>>,
+    alive: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
+    while alive.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
+        sleep_stop(&stop, Duration::from_millis(600));
+        if !alive.load(Ordering::SeqCst) {
+            break;
+        }
+        if let Some(text) = clip.poll_local_change() {
+            let mut w = writer.lock().unwrap();
+            if write_message(&mut *w, &Message::Clipboard { text }).is_err() {
+                break;
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ConnState {
@@ -157,6 +180,17 @@ fn run(
             *slot.lock().unwrap() = Some(clone);
         }
 
+        // Shared write half so the read loop (ReturnToServer) and the clipboard
+        // thread (Clipboard) never interleave partial frames on the socket.
+        let writer = match stream.try_clone() {
+            Ok(w) => Arc::new(Mutex::new(w)),
+            Err(e) => {
+                update!(|s: &mut Status| push_log(s, format!("stream clone failed: {e}")));
+                sleep_stop(&stop, Duration::from_secs(1));
+                continue;
+            }
+        };
+
         let mut injector = Injector::new(cfg.speed, cfg.ctrl_as_cmd);
         let displays = injector.display_lines();
         update!(|s: &mut Status| s.displays = displays.clone());
@@ -169,6 +203,16 @@ fn run(
             ));
         }
 
+        // Clipboard sync: a poller pushes local changes; incoming Clipboard
+        // messages are applied in the read loop below.
+        let clip = ClipboardState::primed();
+        let alive = Arc::new(AtomicBool::new(true));
+        let clip_thread = {
+            let (clip, writer, alive, stop) =
+                (clip.clone(), writer.clone(), alive.clone(), stop.clone());
+            std::thread::spawn(move || clipboard_loop(clip, writer, alive, stop))
+        };
+
         loop {
             match read_message(&mut stream) {
                 Ok(msg) => {
@@ -179,11 +223,19 @@ fn run(
                         Message::Leave => {
                             update!(|s: &mut Status| push_log(s, "← 제어 회수 (Leave)".to_string()))
                         }
+                        Message::Clipboard { text } => {
+                            let text = text.clone();
+                            update!(|s: &mut Status| push_log(s, "클립보드 수신".to_string()));
+                            clip.apply_remote(text);
+                            continue;
+                        }
                         _ => {}
                     }
-                    if let Err(e) = injector.handle(msg, &mut stream) {
-                        update!(|s: &mut Status| push_log(s, format!("send failed: {e}")));
-                        break;
+                    if let Some(out) = injector.handle(msg) {
+                        let mut w = writer.lock().unwrap();
+                        if write_message(&mut *w, &out).is_err() {
+                            break;
+                        }
                     }
                 }
                 Err(e) => {
@@ -195,6 +247,8 @@ fn run(
             }
         }
 
+        alive.store(false, Ordering::SeqCst);
+        let _ = clip_thread.join();
         injector.release_everything();
         *slot.lock().unwrap() = None;
         if stop.load(Ordering::SeqCst) {

@@ -9,9 +9,9 @@
 //! from that center and the cursor is snapped back. Events injected by our own
 //! `SetCursorPos` carry `LLMHF_INJECTED` and are passed through untouched.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 use kvm_protocol::{Message, MouseButton, Side};
 use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -22,27 +22,46 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_F12, VK_LCONTROL, VK_LMENU, VK_MENU, VK_RCONTROL, VK_RMENU,
 };
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, SetCursorPos,
-    SetWindowsHookExW, TranslateMessage, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
-    LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, PeekMessageW,
+    PostThreadMessageW, SetCursorPos, SetWindowsHookExW, TranslateMessage,
+    UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
+    MSLLHOOKSTRUCT, PM_NOREMOVE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
     WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
-struct Shared {
-    tx: Sender<Message>,
-    mac_side: Side,
-}
-
-static SHARED: OnceLock<Shared> = OnceLock::new();
+// Restartable state (the GUI can start/stop and change settings): the event
+// sink and the Mac side are set on each start rather than once.
+static TX: Mutex<Option<Sender<Message>>> = Mutex::new(None);
+/// Mac side of the screen: 0 = Left, 1 = Right.
+static MAC_SIDE: AtomicI32 = AtomicI32::new(0);
+/// Thread id running the hook message loop, so the GUI can PostThreadMessage a
+/// WM_QUIT to stop it. 0 when no loop is running.
+static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 
 /// True while a handshaken client is attached.
 pub static CONNECTED: AtomicBool = AtomicBool::new(false);
 /// True while input is being forwarded to the client.
 pub static REMOTE: AtomicBool = AtomicBool::new(false);
+
+fn side_to_i32(s: Side) -> i32 {
+    match s {
+        Side::Left => 0,
+        Side::Right => 1,
+    }
+}
+
+fn mac_side() -> Side {
+    if MAC_SIDE.load(Ordering::Relaxed) == 1 {
+        Side::Right
+    } else {
+        Side::Left
+    }
+}
 
 static CENTER_X: AtomicI32 = AtomicI32::new(0);
 static CENTER_Y: AtomicI32 = AtomicI32::new(0);
@@ -51,15 +70,20 @@ static CENTER_Y: AtomicI32 = AtomicI32::new(0);
 static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
 static ALT_DOWN: AtomicBool = AtomicBool::new(false);
 
-pub fn init(tx: Sender<Message>, mac_side: Side) {
-    if SHARED.set(Shared { tx, mac_side }).is_err() {
-        panic!("hooks::init called twice");
-    }
+/// Set the event sink and Mac side for a run. Called each time the engine starts.
+pub fn configure(tx: Sender<Message>, mac_side: Side) {
+    MAC_SIDE.store(side_to_i32(mac_side), Ordering::Relaxed);
+    *TX.lock().unwrap() = Some(tx);
+}
+
+/// Detach the event sink so no more events are forwarded after a stop.
+pub fn clear() {
+    *TX.lock().unwrap() = None;
 }
 
 fn send(msg: Message) {
-    if let Some(s) = SHARED.get() {
-        let _ = s.tx.send(msg);
+    if let Some(tx) = TX.lock().unwrap().as_ref() {
+        let _ = tx.send(msg);
     }
 }
 
@@ -145,14 +169,17 @@ fn edge_span(side: Side) -> (i32, i32) {
     }
 }
 
-/// Diagnostic for `--list-monitors`: prints the detected arrangement and
-/// where the shared edge lands.
-pub fn print_layout(mac_side: Side) {
+/// Diagnostic: the detected monitor arrangement and where the shared edge lands,
+/// as text for the GUI.
+pub fn layout_string(mac_side: Side) -> String {
+    use std::fmt::Write;
     let v = virt_screen();
-    println!("virtual screen: {}x{} at ({}, {})", v.w, v.h, v.x, v.y);
+    let mut s = String::new();
+    let _ = writeln!(s, "가상 화면: {}x{} at ({}, {})", v.w, v.h, v.x, v.y);
     for (i, rc) in monitor_rects().iter().enumerate() {
-        println!(
-            "monitor {}: {}x{} at ({}, {})",
+        let _ = writeln!(
+            s,
+            "모니터 {}: {}x{} at ({}, {})",
             i,
             rc.right - rc.left,
             rc.bottom - rc.top,
@@ -161,12 +188,16 @@ pub fn print_layout(mac_side: Side) {
         );
     }
     let (top, bottom) = edge_span(mac_side);
-    println!("mac-side edge ({mac_side:?}): y span {top}..{bottom} — crossing this edge switches to the Mac");
+    let _ = write!(
+        s,
+        "Mac 쪽 엣지 ({mac_side:?}): y {top}..{bottom} — 이 엣지를 넘으면 Mac으로 전환됩니다"
+    );
+    s
 }
 
 fn enter_remote(cursor: POINT) {
-    let s = SHARED.get().unwrap();
-    let (span_top, span_bottom) = edge_span(s.mac_side);
+    let side = mac_side();
+    let (span_top, span_bottom) = edge_span(side);
     let span_h = (span_bottom - span_top).max(1);
     let y_ratio = ((cursor.y - span_top) as f32 / span_h as f32).clamp(0.0, 1.0);
 
@@ -182,7 +213,7 @@ fn enter_remote(cursor: POINT) {
     ALT_DOWN.store(false, Ordering::Relaxed);
 
     REMOTE.store(true, Ordering::SeqCst);
-    send(Message::Enter { edge: s.mac_side.opposite(), y_ratio });
+    send(Message::Enter { edge: side.opposite(), y_ratio });
     unsafe {
         let _ = SetCursorPos(cx, cy);
     }
@@ -199,12 +230,12 @@ pub fn leave_remote(y_ratio: Option<f32>, notify: bool) {
     if notify {
         send(Message::Leave);
     }
-    let s = SHARED.get().unwrap();
+    let side = mac_side();
     let v = virt_screen();
-    let (span_top, span_bottom) = edge_span(s.mac_side);
+    let (span_top, span_bottom) = edge_span(side);
     let span_h = (span_bottom - span_top).max(1);
     let y = span_top + (y_ratio.unwrap_or(0.5).clamp(0.0, 1.0) * span_h as f32) as i32;
-    let x = match s.mac_side {
+    let x = match side {
         Side::Left => v.x + 5,
         Side::Right => v.x + v.w - 6,
     };
@@ -266,9 +297,9 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
 
     // Local mode: watch for the cursor touching the Mac-side edge.
     if msg == WM_MOUSEMOVE && CONNECTED.load(Ordering::SeqCst) {
-        let s = SHARED.get().unwrap();
+        let side = mac_side();
         let v = virt_screen();
-        let hit = match s.mac_side {
+        let hit = match side {
             Side::Left => info.pt.x <= v.x,
             Side::Right => info.pt.x >= v.x + v.w - 1,
         };
@@ -319,18 +350,57 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     CallNextHookEx(HHOOK::default(), code, wparam, lparam)
 }
 
-pub fn run_message_loop() {
+/// Install the low-level hooks and pump their message loop on the CURRENT thread
+/// (low-level hooks require a message loop on the installing thread). Returns
+/// when [`stop_message_loop`] posts WM_QUIT, uninstalling the hooks first.
+///
+/// Returns false if either hook failed to install.
+pub fn install_and_run() -> bool {
     unsafe {
-        let _mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), HINSTANCE::default(), 0)
-            .expect("failed to install mouse hook");
-        let _kbd_hook =
-            SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), HINSTANCE::default(), 0)
-                .expect("failed to install keyboard hook");
+        // Record the thread id first so a very-early stop() can still post WM_QUIT.
+        HOOK_THREAD_ID.store(GetCurrentThreadId(), Ordering::SeqCst);
+        // Force the message queue to exist now so PostThreadMessage can't be lost
+        // in the window before GetMessageW runs.
+        let mut probe = MSG::default();
+        let _ = PeekMessageW(&mut probe, HWND::default(), 0, 0, PM_NOREMOVE);
+
+        let mouse_hook =
+            match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), HINSTANCE::default(), 0) {
+                Ok(h) => h,
+                Err(_) => {
+                    HOOK_THREAD_ID.store(0, Ordering::SeqCst);
+                    return false;
+                }
+            };
+        let kbd_hook =
+            match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), HINSTANCE::default(), 0) {
+                Ok(h) => h,
+                Err(_) => {
+                    let _ = UnhookWindowsHookEx(mouse_hook);
+                    HOOK_THREAD_ID.store(0, Ordering::SeqCst);
+                    return false;
+                }
+            };
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+
+        HOOK_THREAD_ID.store(0, Ordering::SeqCst);
+        let _ = UnhookWindowsHookEx(mouse_hook);
+        let _ = UnhookWindowsHookEx(kbd_hook);
+        true
+    }
+}
+
+/// Ask the hook message loop to exit (from any thread).
+pub fn stop_message_loop() {
+    let id = HOOK_THREAD_ID.load(Ordering::SeqCst);
+    if id != 0 {
+        unsafe {
+            let _ = PostThreadMessageW(id, WM_QUIT, WPARAM(0), LPARAM(0));
         }
     }
 }
