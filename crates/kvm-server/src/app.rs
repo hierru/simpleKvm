@@ -1,14 +1,21 @@
 //! egui front-end for the Windows server: edits settings, starts/stops the
 //! capture engine, and shows live status.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Margin, RichText, Stroke, TextStyle};
+use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Margin, Pos2, RichText, Stroke, TextStyle};
 use kvm_protocol::Side;
+use tray_icon::menu::MenuId;
 
+use crate::autostart;
 use crate::config::ServerConfig;
 use crate::engine::Engine;
 use crate::hooks;
+use crate::tray::{Tray, TrayState};
+
+const DEFAULT_POS: Pos2 = Pos2::new(120.0, 120.0);
+const OFFSCREEN: Pos2 = Pos2::new(12000.0, 12000.0);
 
 const BG: Color32 = Color32::from_rgb(24, 25, 28);
 const CARD: Color32 = Color32::from_rgb(33, 35, 40);
@@ -25,11 +32,37 @@ pub struct App {
     layout: Option<String>,
     notice: Option<String>,
     styled: bool,
+    tray: Option<Tray>,
+    menu_queue: Arc<Mutex<Vec<MenuId>>>,
+    autostart_on: bool,
+    hidden: bool,
+    shown_pos: Option<Pos2>,
+    last_tray_state: Option<TrayState>,
+    first_frame: bool,
 }
 
 impl App {
-    pub fn new(cfg: ServerConfig) -> Self {
-        App { cfg, engine: None, layout: None, notice: None, styled: false }
+    pub fn new(
+        cfg: ServerConfig,
+        tray: Option<Tray>,
+        menu_queue: Arc<Mutex<Vec<MenuId>>>,
+        autostart_on: bool,
+        start_hidden: bool,
+    ) -> Self {
+        App {
+            cfg,
+            engine: None,
+            layout: None,
+            notice: None,
+            styled: false,
+            tray,
+            menu_queue,
+            autostart_on,
+            hidden: start_hidden,
+            shown_pos: None,
+            last_tray_state: None,
+            first_frame: true,
+        }
     }
 
     fn start(&mut self) {
@@ -40,6 +73,77 @@ impl App {
     fn stop(&mut self) {
         if let Some(mut e) = self.engine.take() {
             e.stop();
+        }
+    }
+
+    fn show(&mut self, ctx: &egui::Context) {
+        self.hidden = false;
+        let pos = self.shown_pos.unwrap_or(DEFAULT_POS);
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// "Hidden" = moved far off-screen so the event loop keeps running (see
+    /// main.rs); the tray brings it back.
+    fn hide(&mut self, ctx: &egui::Context) {
+        self.hidden = true;
+        self.shown_pos = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(OFFSCREEN));
+    }
+
+    fn set_autostart(&mut self, enabled: bool) {
+        match autostart::set(enabled) {
+            Ok(()) => {
+                self.autostart_on = enabled;
+                if let Some(t) = &self.tray {
+                    t.set_autostart_checked(enabled);
+                }
+            }
+            Err(e) => self.notice = Some(format!("자동 실행 설정 실패: {e}")),
+        }
+    }
+
+    fn handle_menu_events(&mut self, ctx: &egui::Context) {
+        let ids: Vec<MenuId> = std::mem::take(&mut *self.menu_queue.lock().unwrap());
+        for id in ids {
+            let Some(tray) = &self.tray else { continue };
+            let (open, quit, auto) =
+                (tray.open_id.clone(), tray.quit_id.clone(), tray.autostart_id.clone());
+            if id == open {
+                self.show(ctx);
+            } else if id == quit {
+                self.stop();
+                std::process::exit(0);
+            } else if id == auto {
+                let target = !self.autostart_on;
+                self.set_autostart(target);
+            }
+        }
+    }
+
+    fn tray_state(&self) -> TrayState {
+        match &self.engine {
+            None => TrayState::Stopped,
+            Some(e) => {
+                let s = e.status.lock().unwrap();
+                if s.client.is_some() {
+                    TrayState::Connected
+                } else if s.listening {
+                    TrayState::Listening
+                } else {
+                    TrayState::Stopped
+                }
+            }
+        }
+    }
+
+    fn sync_tray(&mut self) {
+        let state = self.tray_state();
+        if self.last_tray_state != Some(state) {
+            if let Some(t) = &self.tray {
+                t.set_state(state);
+            }
+            self.last_tray_state = Some(state);
         }
     }
 }
@@ -114,6 +218,23 @@ impl eframe::App for App {
         }
         ctx.request_repaint_after(Duration::from_millis(400));
 
+        self.handle_menu_events(&ctx);
+        self.sync_tray();
+
+        if self.first_frame {
+            self.first_frame = false;
+            // No tray to reopen from: never leave the window stranded off-screen.
+            if self.hidden && self.tray.is_none() {
+                self.show(&ctx);
+            }
+        }
+
+        // Closing the window hides it to the tray instead of quitting.
+        if ctx.input(|i| i.viewport().close_requested()) && self.tray.is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide(&ctx);
+        }
+
         let running = self.engine.is_some();
         let (badge_color, badge_text) = if let Some(e) = &self.engine {
             let s = e.status.lock().unwrap();
@@ -170,6 +291,21 @@ impl eframe::App for App {
                                 ui.selectable_value(&mut self.cfg.mac_side, Side::Right, "오른쪽");
                             });
                         });
+                    });
+
+                    card(ui, "일반", |ui| {
+                        let mut auto = self.autostart_on;
+                        if ui.checkbox(&mut auto, "Windows 시작 시 자동 실행").changed() {
+                            self.set_autostart(auto);
+                        }
+                        ui.label(
+                            RichText::new(
+                                "자동 실행 시 트레이로 조용히 시작됩니다. 창을 닫아도 종료되지 \
+                                 않고 트레이로 내려가며, 종료는 트레이 메뉴에서 하세요.",
+                            )
+                            .size(11.0)
+                            .color(MUTED),
+                        );
                     });
 
                     // Start/stop, full width.
