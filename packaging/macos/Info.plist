@@ -22,5 +22,9 @@
     <true/>
     <key>LSUIElement</key>
     <true/>
+    <!-- Required on macOS 15+: without this key the Local Network permission
+         prompt never appears and LAN connections fail with "No route to host". -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Windows PC의 simpleKvm 서버에 연결해 키보드·마우스·클립보드를 공유하기 위해 로컬 네트워크 접근이 필요합니다.</string>
 </dict>
 </plist>
