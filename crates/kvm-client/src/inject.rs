@@ -118,6 +118,14 @@ impl Injector {
         injector
     }
 
+    /// Human-readable summary of every active display, for the GUI status pane.
+    pub fn display_lines(&self) -> Vec<String> {
+        self.displays
+            .iter()
+            .map(|d| format!("{:.0}x{:.0} at ({:.0}, {:.0})", d.w, d.h, d.x, d.y))
+            .collect()
+    }
+
     /// Re-read the display arrangement (it can change while we run) and
     /// recompute the globals derived from it.
     fn refresh_layout(&mut self) {
