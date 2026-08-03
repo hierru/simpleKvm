@@ -18,7 +18,7 @@ use core_graphics::geometry::CGPoint;
 
 use kvm_protocol::{Message, MouseButton, Side};
 
-use crate::keymap::{map_vk, MappedKey};
+use crate::keymap::{map_vk, Mapped, MappedKey};
 
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 const DOUBLE_CLICK_SLOP: f64 = 6.0;
@@ -356,7 +356,24 @@ impl Injector {
             }
             return;
         };
-        let MappedKey { code, modifier } = mapped;
+        let MappedKey { code, modifier } = match mapped {
+            Mapped::Key(k) => k,
+            Mapped::Combo { code, flags } => {
+                // One-shot chord (e.g. 한/영 -> Ctrl+Space): press and release
+                // with exactly the chord's flags, leaving tracked state alone.
+                if pressed {
+                    for down in [true, false] {
+                        if let Ok(ev) =
+                            CGEvent::new_keyboard_event(self.source.clone(), code, down)
+                        {
+                            ev.set_flags(flags);
+                            ev.post(CGEventTapLocation::HID);
+                        }
+                    }
+                }
+                return;
+            }
+        };
 
         if let Some(flag) = modifier {
             if pressed {

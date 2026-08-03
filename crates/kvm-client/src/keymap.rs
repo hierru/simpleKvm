@@ -13,18 +13,33 @@ pub struct MappedKey {
     pub modifier: Option<CGEventFlags>,
 }
 
-fn key(code: u16) -> Option<MappedKey> {
-    Some(MappedKey { code, modifier: None })
+pub enum Mapped {
+    /// A key that maps 1:1 to a macOS key (possibly a modifier).
+    Key(MappedKey),
+    /// A key that is synthesized as a one-shot shortcut chord on key-down
+    /// (e.g. the 한/영 key becomes Ctrl+Space).
+    Combo { code: u16, flags: CGEventFlags },
 }
 
-fn modifier(code: u16, flag: CGEventFlags) -> Option<MappedKey> {
-    Some(MappedKey { code, modifier: Some(flag) })
+fn key(code: u16) -> Option<Mapped> {
+    Some(Mapped::Key(MappedKey { code, modifier: None }))
+}
+
+fn modifier(code: u16, flag: CGEventFlags) -> Option<Mapped> {
+    Some(Mapped::Key(MappedKey { code, modifier: Some(flag) }))
 }
 
 /// `ctrl_as_cmd` maps the Windows Ctrl key onto macOS Command so that
 /// Ctrl+C/V/X/Z/T/W behave like the usual macOS shortcuts.
-pub fn map_vk(vk: u16, ctrl_as_cmd: bool) -> Option<MappedKey> {
+pub fn map_vk(vk: u16, ctrl_as_cmd: bool) -> Option<Mapped> {
     match vk {
+        // --- Korean IME keys ----------------------------------------------
+        // 한/영 -> Ctrl+Space, macOS's default "이전 입력 소스 선택" shortcut
+        // (시스템 설정 > 키보드 > 단축키 > 입력 소스에서 기본 활성).
+        0x15 => Some(Mapped::Combo { code: 49, flags: CGEventFlags::CGEventFlagControl }),
+        // 한자 -> Option+Return, the macOS Korean IME's Hanja conversion.
+        0x19 => Some(Mapped::Combo { code: 36, flags: CGEventFlags::CGEventFlagAlternate }),
+
         // --- Letters -------------------------------------------------------
         0x41 => key(0),   // A
         0x42 => key(11),  // B
