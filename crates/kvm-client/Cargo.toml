@@ -1,0 +1,11 @@
+[package]
+name = "kvm-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kvm-protocol = { path = "../kvm-protocol" }
+clap.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"

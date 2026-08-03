@@ -1,0 +1,17 @@
+[package]
+name = "kvm-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kvm-protocol = { path = "../kvm-protocol" }
+clap.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+] }
