@@ -55,3 +55,101 @@ impl Engine {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kvm_protocol::{read_message, write_message, Message, Side, PROTOCOL_VERSION};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    /// End-to-end check of the real engine: hooks + listener come up, a client
+    /// handshakes, and the clipboard syncs in both directions.
+    ///
+    /// Ignored by default because it installs real input hooks and touches the
+    /// OS clipboard (saved and restored). Run with:
+    /// `cargo test -p kvm-server -- --ignored`
+    #[test]
+    #[ignore = "installs real hooks and touches the OS clipboard"]
+    fn engine_handshake_and_clipboard_sync() {
+        let cfg = ServerConfig {
+            port: 24911,
+            mac_side: Side::Left,
+            name: "test-server".into(),
+        };
+        let mut engine = Engine::start(&cfg);
+
+        // Wait for the listener to come up.
+        let mut stream = None;
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(100));
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", cfg.port)) {
+                stream = Some(s);
+                break;
+            }
+        }
+        let mut stream = stream.expect("server did not start listening");
+
+        // Handshake.
+        write_message(
+            &mut stream,
+            &Message::Hello { version: PROTOCOL_VERSION, name: "fake-mac".into() },
+        )
+        .unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        match read_message(&mut stream).unwrap() {
+            Message::HelloAck { version, .. } => assert_eq!(version, PROTOCOL_VERSION),
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+
+        let mut cb = arboard::Clipboard::new().unwrap();
+        let saved = cb.get_text().ok();
+
+        // Remote -> local: a Clipboard message from the client must land on
+        // the OS clipboard.
+        let inbound = "simpleKvm-test-remote-\u{d074}\u{b9bd}\u{bcf4}\u{b4dc}";
+        write_message(&mut stream, &Message::Clipboard { text: inbound.into() }).unwrap();
+        let mut applied = false;
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(100));
+            if cb.get_text().ok().as_deref() == Some(inbound) {
+                applied = true;
+                break;
+            }
+        }
+
+        // Local -> remote: a local clipboard change must be sent to the client
+        // by the poller (600ms interval).
+        let outbound = "simpleKvm-test-local-change";
+        cb.set_text(outbound).unwrap();
+        let mut forwarded = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match read_message(&mut stream) {
+                Ok(Message::Clipboard { text }) if text == outbound => {
+                    forwarded = true;
+                    break;
+                }
+                Ok(_) => {} // heartbeats etc.
+                Err(_) => break,
+            }
+        }
+
+        // Restore the user's clipboard before asserting.
+        match saved {
+            Some(t) => {
+                let _ = cb.set_text(t);
+            }
+            None => {
+                let _ = cb.clear();
+            }
+        }
+        drop(stream);
+        engine.stop();
+
+        assert!(applied, "remote clipboard was not applied to the OS clipboard");
+        assert!(forwarded, "local clipboard change was not forwarded to the client");
+    }
+}

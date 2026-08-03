@@ -51,6 +51,8 @@ impl ClientConfig {
         }
     }
 
+    // Used by the macOS GUI; absent from the non-macOS stub build.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn save(&self) -> std::io::Result<()> {
         let Some(dir) = config_dir() else {
             return Ok(());
