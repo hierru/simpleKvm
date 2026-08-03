@@ -16,6 +16,29 @@ mod net;
 
 #[cfg(windows)]
 fn main() -> eframe::Result<()> {
+    // Single-instance guard: hold a fixed loopback port for our lifetime. A
+    // second copy would fail to bind 24800 anyway ("bind 실패: 10048") but only
+    // after the user clicks start — surface it clearly at launch instead.
+    let _lock = match std::net::TcpListener::bind(("127.0.0.1", 24798)) {
+        Ok(l) => l,
+        Err(_) => {
+            unsafe {
+                use windows::core::w;
+                use windows::Win32::Foundation::HWND;
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    MessageBoxW, MB_ICONWARNING, MB_OK,
+                };
+                MessageBoxW(
+                    HWND::default(),
+                    w!("simpleKvm 서버가 이미 실행 중입니다. 기존 창을 사용하세요."),
+                    w!("simpleKvm"),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
+            return Ok(());
+        }
+    };
+
     unsafe {
         use windows::Win32::UI::HiDpi::{
             SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,

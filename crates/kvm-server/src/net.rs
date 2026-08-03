@@ -53,7 +53,10 @@ pub fn run(
     let listener = match TcpListener::bind(("0.0.0.0", port)) {
         Ok(l) => l,
         Err(e) => {
-            push_log(&status, format!("bind {port} 실패: {e}"));
+            push_log(
+                &status,
+                format!("bind {port} 실패: {e} — 다른 simpleKvm 서버가 이미 실행 중인지 확인하세요"),
+            );
             status.lock().unwrap().listening = false;
             return;
         }
