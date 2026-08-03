@@ -1,83 +1,160 @@
 //! TCP listener: accepts one macOS client at a time, forwards captured input
-//! events from the hook thread's channel, and processes client messages
-//! (return-to-server, heartbeats).
+//! events from the hook thread's channel, syncs the clipboard both ways, and
+//! processes client messages (return-to-server, heartbeats). Stoppable and
+//! status-reporting so the GUI can start/stop it.
 
-use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::Ordering;
+use std::io::ErrorKind;
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kvm_protocol::clipboard::ClipboardState;
 use kvm_protocol::{read_message, write_message, Message, PROTOCOL_VERSION};
 
 use crate::hooks::{self, CONNECTED, REMOTE};
 
-pub fn run(port: u16, rx: Receiver<Message>, server_name: String) {
-    let listener = TcpListener::bind(("0.0.0.0", port))
-        .unwrap_or_else(|e| panic!("failed to bind port {port}: {e}"));
-    println!("kvm-server: listening on 0.0.0.0:{port}");
+pub struct ServerStatus {
+    pub listening: bool,
+    pub client: Option<String>,
+    pub log: Vec<String>,
+}
 
-    loop {
+impl ServerStatus {
+    pub fn new() -> Self {
+        ServerStatus { listening: false, client: None, log: Vec::new() }
+    }
+}
+
+impl Default for ServerStatus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn push_log(status: &Arc<Mutex<ServerStatus>>, line: String) {
+    let mut s = status.lock().unwrap();
+    s.log.push(line);
+    let len = s.log.len();
+    if len > 200 {
+        s.log.drain(0..len - 200);
+    }
+}
+
+pub fn run(
+    port: u16,
+    rx: Receiver<Message>,
+    server_name: String,
+    status: Arc<Mutex<ServerStatus>>,
+    stop: Arc<AtomicBool>,
+    clip: ClipboardState,
+) {
+    let listener = match TcpListener::bind(("0.0.0.0", port)) {
+        Ok(l) => l,
+        Err(e) => {
+            push_log(&status, format!("bind {port} 실패: {e}"));
+            status.lock().unwrap().listening = false;
+            return;
+        }
+    };
+    // Non-blocking accept so we can poll the stop flag while idle.
+    let _ = listener.set_nonblocking(true);
+    status.lock().unwrap().listening = true;
+    push_log(&status, format!("0.0.0.0:{port} 에서 대기 중"));
+
+    while !stop.load(Ordering::SeqCst) {
         let (mut stream, addr) = match listener.accept() {
             Ok(pair) => pair,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             Err(e) => {
-                eprintln!("accept failed: {e}");
+                push_log(&status, format!("accept 실패: {e}"));
                 continue;
             }
         };
+        // Blocking I/O for this session; we stop it via shutdown + the stop flag.
+        let _ = stream.set_nonblocking(false);
 
         let client_name = match handshake(&mut stream, &server_name) {
             Ok(name) => name,
             Err(e) => {
-                eprintln!("handshake with {addr} failed: {e}");
+                push_log(&status, format!("{addr} 핸드셰이크 실패: {e}"));
                 continue;
             }
         };
         let _ = stream.set_nodelay(true);
-        println!("client connected: {client_name} ({addr})");
+        push_log(&status, format!("클라이언트 연결됨: {client_name} ({addr})"));
+        status.lock().unwrap().client = Some(client_name.clone());
 
         // Drop events that piled up while nobody was connected.
         while rx.try_recv().is_ok() {}
         CONNECTED.store(true, Ordering::SeqCst);
 
-        let reader_stream = match stream.try_clone() {
-            Ok(s) => s,
+        let writer = match stream.try_clone() {
+            Ok(w) => Arc::new(Mutex::new(w)),
             Err(e) => {
-                eprintln!("stream clone failed: {e}");
+                push_log(&status, format!("stream clone 실패: {e}"));
                 CONNECTED.store(false, Ordering::SeqCst);
                 continue;
             }
         };
-        let reader = std::thread::spawn(move || read_loop(reader_stream));
 
-        // Forward events until the connection dies.
+        // Reader: return-to-server + inbound clipboard.
+        let reader = match stream.try_clone() {
+            Ok(s) => {
+                let clip = clip.clone();
+                Some(std::thread::spawn(move || read_loop(s, clip)))
+            }
+            Err(e) => {
+                push_log(&status, format!("reader clone 실패: {e}"));
+                None
+            }
+        };
+
+        // Clipboard poller: outbound local clipboard changes.
+        let alive = Arc::new(AtomicBool::new(true));
+        let clip_thread = {
+            let (clip, writer, alive, stop) =
+                (clip.clone(), writer.clone(), alive.clone(), stop.clone());
+            std::thread::spawn(move || clipboard_loop(clip, writer, alive, stop))
+        };
+
+        // Forward captured events until the connection dies or we stop.
         loop {
-            if !CONNECTED.load(Ordering::SeqCst) {
+            if !CONNECTED.load(Ordering::SeqCst) || stop.load(Ordering::SeqCst) {
                 break;
             }
-            match rx.recv_timeout(Duration::from_secs(2)) {
-                Ok(msg) => {
-                    if write_message(&mut stream, &msg).is_err() {
-                        break;
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    if write_message(&mut stream, &Message::Heartbeat).is_err() {
-                        break;
-                    }
-                }
-                Err(RecvTimeoutError::Disconnected) => return,
+            let out = match rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(msg) => msg,
+                Err(RecvTimeoutError::Timeout) => Message::Heartbeat,
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+            let mut w = writer.lock().unwrap();
+            if write_message(&mut *w, &out).is_err() {
+                break;
             }
         }
 
         CONNECTED.store(false, Ordering::SeqCst);
+        alive.store(false, Ordering::SeqCst);
         if REMOTE.load(Ordering::SeqCst) {
             // Never leave the user stranded without a cursor on Windows.
             hooks::leave_remote(None, false);
         }
-        let _ = stream.shutdown(std::net::Shutdown::Both);
-        let _ = reader.join();
-        println!("client disconnected: {client_name}");
+        let _ = stream.shutdown(Shutdown::Both);
+        if let Some(r) = reader {
+            let _ = r.join();
+        }
+        let _ = clip_thread.join();
+        status.lock().unwrap().client = None;
+        push_log(&status, format!("클라이언트 연결 해제: {client_name}"));
     }
+
+    status.lock().unwrap().listening = false;
+    push_log(&status, "중지됨".to_string());
 }
 
 fn handshake(stream: &mut TcpStream, server_name: &str) -> std::io::Result<String> {
@@ -101,20 +178,43 @@ fn handshake(stream: &mut TcpStream, server_name: &str) -> std::io::Result<Strin
         stream,
         &Message::HelloAck { version: PROTOCOL_VERSION, name: server_name.to_string() },
     )?;
-    // The client only talks when the cursor returns; block indefinitely and
-    // rely on our outgoing heartbeats to detect a dead connection.
+    // The client only talks when the cursor returns or the clipboard changes;
+    // block indefinitely and rely on our outgoing heartbeats to detect death.
     stream.set_read_timeout(None)?;
     Ok(name)
 }
 
-fn read_loop(mut stream: TcpStream) {
+fn read_loop(mut stream: TcpStream, clip: ClipboardState) {
     loop {
         match read_message(&mut stream) {
             Ok(Message::ReturnToServer { y_ratio }) => hooks::leave_remote(Some(y_ratio), false),
-            Ok(Message::Heartbeat) => {}
+            Ok(Message::Clipboard { text }) => clip.apply_remote(text),
             Ok(_) => {}
             Err(_) => {
                 CONNECTED.store(false, Ordering::SeqCst);
+                break;
+            }
+        }
+    }
+}
+
+/// Poll the OS clipboard and forward local changes to the connected client.
+fn clipboard_loop(
+    clip: ClipboardState,
+    writer: Arc<Mutex<TcpStream>>,
+    alive: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
+    while alive.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
+        for _ in 0..6 {
+            if !alive.load(Ordering::SeqCst) || stop.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if let Some(text) = clip.poll_local_change() {
+            let mut w = writer.lock().unwrap();
+            if write_message(&mut *w, &Message::Clipboard { text }).is_err() {
                 break;
             }
         }

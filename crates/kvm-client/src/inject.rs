@@ -7,7 +7,6 @@
 //! display(s) that own the shared edge.
 
 use std::collections::HashSet;
-use std::io::Write;
 use std::time::{Duration, Instant};
 
 use core_graphics::display::CGDisplay;
@@ -17,7 +16,7 @@ use core_graphics::event::{
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 
-use kvm_protocol::{write_message, Message, MouseButton, Side};
+use kvm_protocol::{Message, MouseButton, Side};
 
 use crate::keymap::{map_vk, MappedKey};
 
@@ -118,6 +117,14 @@ impl Injector {
         injector
     }
 
+    /// Human-readable summary of every active display, for the GUI status pane.
+    pub fn display_lines(&self) -> Vec<String> {
+        self.displays
+            .iter()
+            .map(|d| format!("{:.0}x{:.0} at ({:.0}, {:.0})", d.w, d.h, d.x, d.y))
+            .collect()
+    }
+
     /// Re-read the display arrangement (it can change while we run) and
     /// recompute the globals derived from it.
     fn refresh_layout(&mut self) {
@@ -149,11 +156,9 @@ impl Injector {
             .unwrap_or(self.displays[0])
     }
 
-    pub fn handle(
-        &mut self,
-        msg: Message,
-        stream: &mut impl Write,
-    ) -> std::io::Result<()> {
+    /// Process one incoming message. Returns a message to send back to the
+    /// server (currently only `ReturnToServer`), if any.
+    pub fn handle(&mut self, msg: Message) -> Option<Message> {
         match msg {
             Message::Enter { edge, y_ratio } => {
                 self.edge = edge;
@@ -204,7 +209,7 @@ impl Injector {
                         let y_ratio = ((ny - top) / span_h).clamp(0.0, 1.0) as f32;
                         self.in_control = false;
                         self.release_everything();
-                        write_message(stream, &Message::ReturnToServer { y_ratio })?;
+                        return Some(Message::ReturnToServer { y_ratio });
                     } else {
                         // Dead zone or outer edge: stay on the current display.
                         self.pos = (
@@ -246,7 +251,7 @@ impl Injector {
             Message::Heartbeat => {}
             _ => {}
         }
-        Ok(())
+        None
     }
 
     fn current_move_type(&self) -> CGEventType {

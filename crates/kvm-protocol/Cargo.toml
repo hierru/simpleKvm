@@ -6,3 +6,8 @@ edition.workspace = true
 [dependencies]
 serde.workspace = true
 bincode.workspace = true
+arboard = { version = "3", optional = true }
+
+[features]
+# Clipboard sync helper (pulls arboard). Enabled by the client and server.
+clipboard = ["dep:arboard"]
