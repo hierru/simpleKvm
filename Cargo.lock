@@ -2100,6 +2100,7 @@ dependencies = [
  "kvm-protocol",
  "serde",
  "serde_json",
+ "tray-icon",
  "windows 0.58.0",
 ]
 
