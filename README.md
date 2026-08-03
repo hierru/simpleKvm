@@ -59,7 +59,9 @@ GUI 창에서 설정 후 **시작**:
 open dist/simpleKvm.app
 ```
 
-메뉴바(상태표시줄)에 아이콘이 뜹니다. 아이콘 클릭 → **설정 열기**에서 Windows PC의 LAN IP 등을 입력하고 **연결**하세요.
+메뉴바(상태표시줄)에 아이콘이 뜹니다. 아이콘 클릭 → **설정 열기**에서 서버를 지정하고 **연결**하세요.
+서버가 실행 중이면 설정 화면의 **"네트워크에서 발견된 서버"** 목록에 자동으로 나타나며(mDNS),
+**사용** 버튼으로 주소·포트가 채워집니다. 목록에 안 뜨면 LAN IP를 직접 입력하면 됩니다.
 설정은 `~/Library/Application Support/simpleKvm/client.json`에 저장됩니다.
 
 메뉴바 메뉴: **설정 열기 / 로그인 시 자동 실행 / 종료**. 창을 닫으면 종료되지 않고 메뉴바로 숨습니다.
@@ -153,9 +155,11 @@ crates/
 - [x] ~~트레이 아이콘 / GUI 설정~~ (Mac 메뉴바 앱 + Windows GUI)
 - [x] ~~한/영 전환 키 매핑~~ (한/영 → Ctrl+Space, 한자 → Option+Return)
 - [x] ~~Windows 서버 트레이/자동 시작~~ (상태별 아이콘 색상 포함)
+- [x] ~~mDNS 자동 탐색~~ (서버 광고 + 클라이언트 발견 목록. 안 보이면 Windows 방화벽에서
+      kvm-server의 UDP 5353 인바운드 허용 필요: `netsh advfirewall firewall add rule
+      name="simpleKvm mDNS" dir=in action=allow protocol=UDP localport=5353`)
 - [ ] 클립보드 이미지/파일 동기화 (현재는 텍스트만)
 - [ ] 원격 모드 중 Windows 커서가 화면 중앙에 보임 (Raw Input + 커서 숨김으로 개선 예정)
-- [ ] mDNS 자동 탐색 (현재는 IP 직접 입력)
 - [ ] 전송 암호화(TLS) — 현재 평문이므로 신뢰할 수 있는 LAN에서만 사용
 - [x] ~~Mac 다중 모니터~~
 - [x] ~~Windows 다중 모니터~~

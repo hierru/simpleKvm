@@ -46,6 +46,7 @@ pub struct App {
     shown_pos: Option<Pos2>,
     styled: bool,
     first_frame: bool,
+    discovery: Option<crate::discovery::Discovery>,
 }
 
 impl App {
@@ -67,6 +68,7 @@ impl App {
             shown_pos: None,
             styled: false,
             first_frame: true,
+            discovery: crate::discovery::Discovery::start(),
         }
     }
 
@@ -325,6 +327,37 @@ impl eframe::App for App {
                                 );
                             });
                         });
+
+                        // Servers advertising themselves on the LAN (mDNS).
+                        let discovered = self
+                            .discovery
+                            .as_ref()
+                            .map(|d| d.servers.lock().unwrap().clone())
+                            .unwrap_or_default();
+                        if !discovered.is_empty() {
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new("네트워크에서 발견된 서버")
+                                    .size(12.0)
+                                    .color(MUTED),
+                            );
+                            ui.add_space(3.0);
+                            for s in discovered {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("사용").clicked() {
+                                        self.cfg.server = s.addr.clone();
+                                        self.cfg.port = s.port;
+                                    }
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} — {}:{}",
+                                            s.name, s.addr, s.port
+                                        ))
+                                        .size(12.0),
+                                    );
+                                });
+                            }
+                        }
                     });
 
                     card(ui, "옵션", |ui| {

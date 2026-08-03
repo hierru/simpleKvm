@@ -9,6 +9,8 @@ use std::str::FromStr;
 
 pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_PORT: u16 = 24800;
+/// mDNS/DNS-SD service type used for LAN auto-discovery.
+pub const MDNS_SERVICE_TYPE: &str = "_simplekvm._tcp.local.";
 
 /// Upper bound on a single frame; input events are tiny, this only guards
 /// against garbage from a non-protocol peer.
