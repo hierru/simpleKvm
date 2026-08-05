@@ -23,6 +23,41 @@ use crate::keymap::{map_vk, Mapped, MappedKey};
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 const DOUBLE_CLICK_SLOP: f64 = 6.0;
 
+/// Private window-server API (same call Synergy/Barrier use): without the
+/// `SetsCursorInBackground` connection property, cursor moves posted by a
+/// background process relocate the pointer but the cursor is not redrawn —
+/// it looks like the cursor vanished while we drive it.
+mod cgs {
+    use std::os::raw::{c_int, c_void};
+    extern "C" {
+        pub fn _CGSDefaultConnection() -> c_int;
+        pub fn CGSSetConnectionProperty(
+            cid: c_int,
+            target_cid: c_int,
+            key: *const c_void,   // CFStringRef
+            value: *const c_void, // CFTypeRef
+        ) -> c_int;
+    }
+}
+
+fn enable_background_cursor_drawing() {
+    use core_foundation::base::TCFType;
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::string::CFString;
+
+    let key = CFString::from_static_string("SetsCursorInBackground");
+    let value = CFBoolean::true_value();
+    unsafe {
+        let cid = cgs::_CGSDefaultConnection();
+        let _ = cgs::CGSSetConnectionProperty(
+            cid,
+            cid,
+            key.as_concrete_TypeRef() as *const _,
+            value.as_CFTypeRef(),
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Rect {
     x: f64,
@@ -87,6 +122,7 @@ pub struct Injector {
 
 impl Injector {
     pub fn new(speed: f64, ctrl_as_cmd: bool) -> Self {
+        enable_background_cursor_drawing();
         let mut injector = Injector {
             source: CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                 .expect("failed to create CGEventSource"),
@@ -184,6 +220,13 @@ impl Injector {
                 };
                 self.pos = (x, y.clamp(target.y, target.bottom() - 1.0));
                 self.in_control = true;
+                // The cursor may be in a hidden state (e.g. after typing);
+                // make sure it is drawn where we just warped it.
+                let _ = CGDisplay::main().show_cursor();
+                eprintln!(
+                    "enter: edge={:?} ratio={y_ratio:.3} span=({top:.0},{bottom:.0}) -> pos=({:.0},{:.0})",
+                    edge, self.pos.0, self.pos.1
+                );
                 self.post_move();
             }
             Message::Leave => {
@@ -440,6 +483,35 @@ impl Injector {
             self.other_down = false;
         }
     }
+}
+
+/// Human-readable dump of the detected display arrangement, for the settings
+/// UI — lets the user compare against 시스템 설정 > 디스플레이 정렬.
+pub fn layout_string() -> String {
+    let rects = active_display_rects();
+    let min_x = rects.iter().map(|d| d.x).fold(f64::MAX, f64::min);
+    let max_x = rects.iter().map(|d| d.right()).fold(f64::MIN, f64::max);
+    let mut s = String::new();
+    let mut left_owners = Vec::new();
+    let mut right_owners = Vec::new();
+    for (i, d) in rects.iter().enumerate() {
+        s.push_str(&format!(
+            "디스플레이 {}: {:.0}x{:.0} @ ({:.0}, {:.0})\n",
+            i, d.w, d.h, d.x, d.y
+        ));
+        if d.x <= min_x + 0.5 {
+            left_owners.push(i.to_string());
+        }
+        if d.right() >= max_x - 0.5 {
+            right_owners.push(i.to_string());
+        }
+    }
+    s.push_str(&format!(
+        "가로 범위: {min_x:.0} .. {max_x:.0}\n왼쪽 엣지 소유: 디스플레이 {}\n오른쪽 엣지 소유: 디스플레이 {}",
+        left_owners.join(","),
+        right_owners.join(",")
+    ));
+    s
 }
 
 /// Distance from `v` to the closed range [lo, hi] (0 when inside).

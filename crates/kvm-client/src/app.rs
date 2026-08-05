@@ -47,6 +47,7 @@ pub struct App {
     styled: bool,
     first_frame: bool,
     discovery: Option<crate::discovery::Discovery>,
+    layout: Option<String>,
 }
 
 impl App {
@@ -69,6 +70,7 @@ impl App {
             styled: false,
             first_frame: true,
             discovery: crate::discovery::Discovery::start(),
+            layout: None,
         }
     }
 
@@ -388,7 +390,18 @@ impl eframe::App for App {
                     ui.colored_label(WARN, RichText::new(msg).size(12.0));
                 }
 
-                ui.add_space(16.0);
+                ui.add_space(14.0);
+                if ui.button("디스플레이 배치 보기").clicked() {
+                    self.layout = Some(crate::inject::layout_string());
+                }
+                if let Some(layout) = &self.layout {
+                    ui.add_space(8.0);
+                    card(ui, "디스플레이 배치", |ui| {
+                        ui.label(RichText::new(layout).monospace().size(11.0).color(TEXT));
+                    });
+                }
+
+                ui.add_space(8.0);
                 self.status_pane(ui);
                 });
             });
