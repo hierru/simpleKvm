@@ -242,19 +242,29 @@ impl Injector {
                     self.post_move();
                 } else {
                     let cur = self.display_at(self.pos.0, self.pos.1);
+                    // Any dead-zone exit toward the server returns control —
+                    // from whichever display the cursor is on, not only the
+                    // one owning the global extreme (Synergy-style). This
+                    // keeps the return reachable in L-shaped arrangements
+                    // where another display sticks out further sideways.
                     let crossed = match self.edge {
-                        Side::Right => nx > self.max_x - 1.0 && self.owns_edge(&cur),
-                        Side::Left => nx < self.min_x && self.owns_edge(&cur),
+                        Side::Right => nx > cur.right() - 1.0,
+                        Side::Left => nx < cur.x,
                     };
                     if crossed {
                         let (top, bottom) = self.edge_span;
                         let span_h = (bottom - top).max(1.0);
                         let y_ratio = ((ny - top) / span_h).clamp(0.0, 1.0) as f32;
+                        eprintln!(
+                            "return: from=({:.0},{:.0}) display=({:.0},{:.0} {:.0}x{:.0}) ratio={y_ratio:.3}",
+                            self.pos.0, self.pos.1, cur.x, cur.y, cur.w, cur.h
+                        );
                         self.in_control = false;
                         self.release_everything();
                         return Some(Message::ReturnToServer { y_ratio });
                     } else {
-                        // Dead zone or outer edge: stay on the current display.
+                        // Dead zone above/below or the far edge: stay on the
+                        // current display.
                         self.pos = (
                             nx.clamp(cur.x, cur.right() - 1.0),
                             ny.clamp(cur.y, cur.bottom() - 1.0),
