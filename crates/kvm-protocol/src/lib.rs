@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use std::str::FromStr;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const DEFAULT_PORT: u16 = 24800;
 /// mDNS/DNS-SD service type used for LAN auto-discovery.
 pub const MDNS_SERVICE_TYPE: &str = "_simplekvm._tcp.local.";
@@ -40,6 +40,17 @@ impl FromStr for Side {
             other => Err(format!("expected 'left' or 'right', got '{other}'")),
         }
     }
+}
+
+/// One display's bounds in its machine's own coordinate space (server:
+/// physical pixels, client: macOS points). Units are consistent within one
+/// machine, which is all the combined layout view needs.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub struct DisplayRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -78,6 +89,13 @@ pub enum Message {
 
     /// Either direction: the sender's clipboard text changed. Text-only for now.
     Clipboard { text: String },
+
+    /// Server -> client, right after the handshake: the server's monitor
+    /// arrangement and which side of it the Mac sits on.
+    ServerLayout { monitors: Vec<DisplayRect>, mac_side: Side },
+    /// Client -> server, right after the handshake: the client's display
+    /// arrangement.
+    ClientLayout { displays: Vec<DisplayRect> },
 
     Heartbeat,
 }
@@ -173,6 +191,13 @@ mod tests {
             Message::Key { vk: 0x41, pressed: true },
             Message::ReturnToServer { y_ratio: 1.0 },
             Message::Clipboard { text: "hello 클립보드".into() },
+            Message::ServerLayout {
+                monitors: vec![DisplayRect { x: 0.0, y: 0.0, w: 3840.0, h: 2160.0 }],
+                mac_side: Side::Left,
+            },
+            Message::ClientLayout {
+                displays: vec![DisplayRect { x: 0.0, y: 0.0, w: 2560.0, h: 1440.0 }],
+            },
         ];
         let mut buf = Vec::new();
         for m in &msgs {

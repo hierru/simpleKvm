@@ -31,9 +31,9 @@ impl Engine {
         let clip = ClipboardState::primed();
 
         let net_thread = {
-            let (port, name, status, stop, clip) =
-                (cfg.port, cfg.name.clone(), status.clone(), stop.clone(), clip);
-            std::thread::spawn(move || net::run(port, rx, name, status, stop, clip))
+            let (port, name, mac_side, status, stop, clip) =
+                (cfg.port, cfg.name.clone(), cfg.mac_side, status.clone(), stop.clone(), clip);
+            std::thread::spawn(move || net::run(port, rx, name, mac_side, status, stop, clip))
         };
 
         // Low-level hooks must be installed and pumped on their own thread.

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use eframe::egui;
 use kvm_protocol::clipboard::ClipboardState;
-use kvm_protocol::{read_message, write_message, Message, PROTOCOL_VERSION};
+use kvm_protocol::{read_message, write_message, DisplayRect, Message, Side, PROTOCOL_VERSION};
 
 use crate::config::ClientConfig;
 use crate::inject::Injector;
@@ -49,12 +49,21 @@ pub struct Status {
     pub state: ConnState,
     pub server_name: Option<String>,
     pub displays: Vec<String>,
+    /// The server's monitor arrangement and which side of it this Mac sits on,
+    /// for the combined map.
+    pub server_layout: Option<(Vec<DisplayRect>, Side)>,
     pub log: Vec<String>,
 }
 
 impl Status {
     fn new() -> Self {
-        Status { state: ConnState::Idle, server_name: None, displays: Vec::new(), log: Vec::new() }
+        Status {
+            state: ConnState::Idle,
+            server_name: None,
+            displays: Vec::new(),
+            server_layout: None,
+            log: Vec::new(),
+        }
     }
 }
 
@@ -174,6 +183,13 @@ fn run(
             }
         }
 
+        // Share our display arrangement so the server can draw the combined map.
+        let displays: Vec<DisplayRect> = crate::inject::ui_display_rects()
+            .into_iter()
+            .map(|(x, y, w, h)| DisplayRect { x, y, w, h })
+            .collect();
+        let _ = write_message(&mut stream, &Message::ClientLayout { displays });
+
         // Blocking reads from here; stop() unblocks us via socket shutdown.
         let _ = stream.set_read_timeout(None);
         if let Ok(clone) = stream.try_clone() {
@@ -229,6 +245,11 @@ fn run(
                             clip.apply_remote(text);
                             continue;
                         }
+                        Message::ServerLayout { monitors, mac_side } => {
+                            let layout = (monitors.clone(), *mac_side);
+                            update!(|s: &mut Status| s.server_layout = Some(layout.clone()));
+                            continue;
+                        }
                         _ => {}
                     }
                     if let Some(out) = injector.handle(msg) {
@@ -254,7 +275,10 @@ fn run(
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        update!(|s: &mut Status| s.state = ConnState::Connecting);
+        update!(|s: &mut Status| {
+            s.state = ConnState::Connecting;
+            s.server_layout = None;
+        });
         sleep_stop(&stop, Duration::from_secs(1));
     }
 
@@ -262,6 +286,7 @@ fn run(
         s.state = ConnState::Idle;
         s.server_name = None;
         s.displays.clear();
+        s.server_layout = None;
         push_log(s, "disconnected".to_string());
     });
 }

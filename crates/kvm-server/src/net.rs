@@ -11,19 +11,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kvm_protocol::clipboard::ClipboardState;
-use kvm_protocol::{read_message, write_message, Message, PROTOCOL_VERSION};
+use kvm_protocol::{read_message, write_message, DisplayRect, Message, Side, PROTOCOL_VERSION};
 
 use crate::hooks::{self, CONNECTED, REMOTE};
 
 pub struct ServerStatus {
     pub listening: bool,
     pub client: Option<String>,
+    /// The connected client's display arrangement, for the combined map.
+    pub client_layout: Option<Vec<DisplayRect>>,
     pub log: Vec<String>,
 }
 
 impl ServerStatus {
     pub fn new() -> Self {
-        ServerStatus { listening: false, client: None, log: Vec::new() }
+        ServerStatus { listening: false, client: None, client_layout: None, log: Vec::new() }
     }
 }
 
@@ -46,6 +48,7 @@ pub fn run(
     port: u16,
     rx: Receiver<Message>,
     server_name: String,
+    mac_side: Side,
     status: Arc<Mutex<ServerStatus>>,
     stop: Arc<AtomicBool>,
     clip: ClipboardState,
@@ -92,6 +95,13 @@ pub fn run(
         push_log(&status, format!("클라이언트 연결됨: {client_name} ({addr})"));
         status.lock().unwrap().client = Some(client_name.clone());
 
+        // Share our monitor arrangement so the client can draw the combined map.
+        let monitors: Vec<DisplayRect> = hooks::ui_monitor_rects()
+            .into_iter()
+            .map(|(x, y, w, h)| DisplayRect { x, y, w, h })
+            .collect();
+        let _ = write_message(&mut stream, &Message::ServerLayout { monitors, mac_side });
+
         // Drop events that piled up while nobody was connected.
         while rx.try_recv().is_ok() {}
         CONNECTED.store(true, Ordering::SeqCst);
@@ -105,11 +115,12 @@ pub fn run(
             }
         };
 
-        // Reader: return-to-server + inbound clipboard.
+        // Reader: return-to-server + inbound clipboard + client layout.
         let reader = match stream.try_clone() {
             Ok(s) => {
                 let clip = clip.clone();
-                Some(std::thread::spawn(move || read_loop(s, clip)))
+                let status = status.clone();
+                Some(std::thread::spawn(move || read_loop(s, clip, status)))
             }
             Err(e) => {
                 push_log(&status, format!("reader clone 실패: {e}"));
@@ -152,7 +163,11 @@ pub fn run(
             let _ = r.join();
         }
         let _ = clip_thread.join();
-        status.lock().unwrap().client = None;
+        {
+            let mut s = status.lock().unwrap();
+            s.client = None;
+            s.client_layout = None;
+        }
         push_log(&status, format!("클라이언트 연결 해제: {client_name}"));
     }
 
@@ -187,11 +202,14 @@ fn handshake(stream: &mut TcpStream, server_name: &str) -> std::io::Result<Strin
     Ok(name)
 }
 
-fn read_loop(mut stream: TcpStream, clip: ClipboardState) {
+fn read_loop(mut stream: TcpStream, clip: ClipboardState, status: Arc<Mutex<ServerStatus>>) {
     loop {
         match read_message(&mut stream) {
             Ok(Message::ReturnToServer { y_ratio }) => hooks::leave_remote(Some(y_ratio), false),
             Ok(Message::Clipboard { text }) => clip.apply_remote(text),
+            Ok(Message::ClientLayout { displays }) => {
+                status.lock().unwrap().client_layout = Some(displays);
+            }
             Ok(_) => {}
             Err(_) => {
                 CONNECTED.store(false, Ordering::SeqCst);

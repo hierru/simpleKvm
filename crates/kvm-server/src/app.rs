@@ -48,7 +48,7 @@ impl App {
         autostart_on: bool,
         start_hidden: bool,
     ) -> Self {
-        App {
+        let mut app = App {
             cfg,
             engine: None,
             notice: None,
@@ -60,7 +60,13 @@ impl App {
             shown_pos: None,
             last_tray_state: None,
             first_frame: true,
+        };
+        // An autostarted (tray-only) server should serve without requiring the
+        // user to open the window and click start.
+        if start_hidden {
+            app.start();
         }
+        app
     }
 
     fn start(&mut self) {
@@ -261,6 +267,165 @@ fn monitor_map(ui: &mut egui::Ui, rects: &[(f32, f32, f32, f32)], mac_side: Opti
     }
 }
 
+/// Combined arrangement of both machines while connected: each side is scaled
+/// so the two facing edge-spans render the same height — which is exactly how
+/// cursor positions map across the shared edge — and joined with accent lines.
+/// `remote_side` is the side of the local machine the remote machine sits on.
+fn combined_map(
+    ui: &mut egui::Ui,
+    local_label: &str,
+    local: &[(f32, f32, f32, f32)],
+    remote_label: &str,
+    remote: &[(f32, f32, f32, f32)],
+    remote_side: Side,
+) {
+    if local.is_empty() || remote.is_empty() {
+        return;
+    }
+
+    struct Group<'a> {
+        label: &'a str,
+        rects: &'a [(f32, f32, f32, f32)],
+        is_local: bool,
+        facing: Side,
+    }
+    let (left, right) = match remote_side {
+        Side::Left => (
+            Group { label: remote_label, rects: remote, is_local: false, facing: Side::Right },
+            Group { label: local_label, rects: local, is_local: true, facing: Side::Left },
+        ),
+        Side::Right => (
+            Group { label: local_label, rects: local, is_local: true, facing: Side::Right },
+            Group { label: remote_label, rects: remote, is_local: false, facing: Side::Left },
+        ),
+    };
+
+    fn bounds(rects: &[(f32, f32, f32, f32)]) -> (f32, f32, f32, f32) {
+        let min_x = rects.iter().map(|r| r.0).fold(f32::MAX, f32::min);
+        let min_y = rects.iter().map(|r| r.1).fold(f32::MAX, f32::min);
+        let max_x = rects.iter().map(|r| r.0 + r.2).fold(f32::MIN, f32::max);
+        let max_y = rects.iter().map(|r| r.1 + r.3).fold(f32::MIN, f32::max);
+        (min_x, min_y, max_x, max_y)
+    }
+    fn facing_span(rects: &[(f32, f32, f32, f32)], facing: Side) -> (f32, f32) {
+        let (min_x, min_y, max_x, max_y) = bounds(rects);
+        let mut top = f32::MAX;
+        let mut bottom = f32::MIN;
+        for r in rects {
+            let owns = match facing {
+                Side::Right => r.0 + r.2 >= max_x - 0.5,
+                Side::Left => r.0 <= min_x + 0.5,
+            };
+            if owns {
+                top = top.min(r.1);
+                bottom = bottom.max(r.1 + r.3);
+            }
+        }
+        if top < bottom { (top, bottom) } else { (min_y, max_y) }
+    }
+
+    const SPAN_PX: f32 = 100.0;
+    const GAP: f32 = 16.0;
+    let pad = 12.0;
+    let label_h = 18.0;
+
+    let groups = [&left, &right];
+    let mut b = [(0.0f32, 0.0f32, 0.0f32, 0.0f32); 2];
+    let mut span = [(0.0f32, 0.0f32); 2];
+    let mut scale = [0.0f32; 2];
+    for (i, g) in groups.iter().enumerate() {
+        b[i] = bounds(g.rects);
+        span[i] = facing_span(g.rects, g.facing);
+        scale[i] = SPAN_PX / (span[i].1 - span[i].0).max(1.0);
+    }
+    let span_off = [(span[0].0 - b[0].1) * scale[0], (span[1].0 - b[1].1) * scale[1]];
+    let align = span_off[0].max(span_off[1]);
+    let y0 = [align - span_off[0], align - span_off[1]];
+    let size = [
+        ((b[0].2 - b[0].0) * scale[0], (b[0].3 - b[0].1) * scale[0]),
+        ((b[1].2 - b[1].0) * scale[1], (b[1].3 - b[1].1) * scale[1]),
+    ];
+    let content_w = size[0].0 + GAP + size[1].0;
+    let content_h = (y0[0] + size[0].1).max(y0[1] + size[1].1);
+
+    let avail = ui.available_width();
+    let fit = ((avail - pad * 2.0) / content_w).min(1.0);
+    let (response, painter) = ui.allocate_painter(
+        egui::vec2(avail, content_h * fit + label_h + pad * 2.0),
+        egui::Sense::hover(),
+    );
+    let panel = response.rect;
+    painter.rect_filled(panel, CornerRadius::same(8), Color32::from_rgb(20, 21, 24));
+
+    let origin_x = panel.center().x - content_w * fit / 2.0;
+    let origin_y = panel.min.y + pad + label_h;
+    let group_x = [origin_x, origin_x + (size[0].0 + GAP) * fit];
+
+    for (i, g) in groups.iter().enumerate() {
+        let s = scale[i] * fit;
+        let gx = group_x[i];
+        let gy = origin_y + y0[i] * fit;
+
+        painter.text(
+            egui::pos2(gx + size[i].0 * fit / 2.0, panel.min.y + pad),
+            egui::Align2::CENTER_TOP,
+            g.label,
+            FontId::new(11.0, FontFamily::Proportional),
+            MUTED,
+        );
+
+        let (fill, stroke_c) = if g.is_local {
+            (Color32::from_rgb(44, 47, 53), CARD_STROKE)
+        } else {
+            (Color32::from_rgb(36, 46, 66), Color32::from_rgb(58, 82, 128))
+        };
+        for (j, r) in g.rects.iter().enumerate() {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(gx + (r.0 - b[i].0) * s, gy + (r.1 - b[i].1) * s),
+                egui::vec2(r.2 * s, r.3 * s),
+            )
+            .shrink(2.0);
+            painter.rect_filled(rect, CornerRadius::same(5), fill);
+            painter.rect_stroke(
+                rect,
+                CornerRadius::same(5),
+                Stroke::new(1.0, stroke_c),
+                egui::StrokeKind::Inside,
+            );
+            let num_size = (rect.height() * 0.34).clamp(12.0, 28.0);
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                (j + 1).to_string(),
+                FontId::new(num_size, FontFamily::Proportional),
+                Color32::WHITE,
+            );
+        }
+
+        // Accent line along the shared (facing) edge, spanning the mapped rows.
+        let edge_x = match g.facing {
+            Side::Right => gx + size[i].0 * fit,
+            Side::Left => gx,
+        };
+        let sy0 = gy + (span[i].0 - b[i].1) * s;
+        let sy1 = gy + (span[i].1 - b[i].1) * s;
+        painter.line_segment(
+            [egui::pos2(edge_x, sy0), egui::pos2(edge_x, sy1)],
+            Stroke::new(3.0, ACCENT),
+        );
+    }
+
+    // Faint connector between the two shared edges.
+    let mid_y = origin_y + (align + SPAN_PX / 2.0) * fit;
+    painter.line_segment(
+        [
+            egui::pos2(group_x[0] + size[0].0 * fit + 2.0, mid_y),
+            egui::pos2(group_x[1] - 2.0, mid_y),
+        ],
+        Stroke::new(1.5, Color32::from_rgba_unmultiplied(76, 141, 255, 140)),
+    );
+}
+
 fn status_badge(ui: &mut egui::Ui, color: Color32, text: &str) {
     egui::Frame::NONE
         .fill(Color32::from_rgb(40, 43, 49))
@@ -405,17 +570,43 @@ impl eframe::App for App {
                     }
 
                     ui.add_space(14.0);
+                    let client_layout = self
+                        .engine
+                        .as_ref()
+                        .and_then(|e| e.status.lock().unwrap().client_layout.clone());
                     card(ui, "모니터 배치", |ui| {
-                        monitor_map(ui, &hooks::ui_monitor_rects(), Some(self.cfg.mac_side));
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new(
-                                "파란색 모니터의 바깥쪽 가장자리를 넘으면 Mac으로 전환됩니다. \
-                                 배치는 Windows 디스플레이 설정 기준입니다.",
-                            )
-                            .size(11.0)
-                            .color(MUTED),
-                        );
+                        if let Some(remote) = &client_layout {
+                            let remote: Vec<(f32, f32, f32, f32)> =
+                                remote.iter().map(|d| (d.x, d.y, d.w, d.h)).collect();
+                            combined_map(
+                                ui,
+                                "Windows (이 PC)",
+                                &hooks::ui_monitor_rects(),
+                                "Mac",
+                                &remote,
+                                self.cfg.mac_side,
+                            );
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(
+                                    "연결된 Mac을 포함한 전체 배치입니다. 파란 선이 서로 \
+                                     이어지는 전환 엣지이며, 커서는 같은 높이로 넘어갑니다.",
+                                )
+                                .size(11.0)
+                                .color(MUTED),
+                            );
+                        } else {
+                            monitor_map(ui, &hooks::ui_monitor_rects(), Some(self.cfg.mac_side));
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(
+                                    "파란색 모니터의 바깥쪽 가장자리를 넘으면 Mac으로 전환됩니다. \
+                                     Mac이 연결되면 전체 배치가 표시됩니다.",
+                                )
+                                .size(11.0)
+                                .color(MUTED),
+                            );
+                        }
                     });
 
                     ui.add_space(8.0);
