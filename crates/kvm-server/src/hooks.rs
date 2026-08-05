@@ -106,6 +106,21 @@ fn virt_screen() -> VirtScreen {
     }
 }
 
+/// Monitor rects as (x, y, w, h) for the settings-UI arrangement map.
+pub fn ui_monitor_rects() -> Vec<(f32, f32, f32, f32)> {
+    monitor_rects()
+        .iter()
+        .map(|rc| {
+            (
+                rc.left as f32,
+                rc.top as f32,
+                (rc.right - rc.left) as f32,
+                (rc.bottom - rc.top) as f32,
+            )
+        })
+        .collect()
+}
+
 fn monitor_rects() -> Vec<RECT> {
     unsafe extern "system" fn cb(_mon: HMONITOR, _hdc: HDC, rc: *mut RECT, lp: LPARAM) -> BOOL {
         let rects = unsafe { &mut *(lp.0 as *mut Vec<RECT>) };
@@ -167,32 +182,6 @@ fn edge_span(side: Side) -> (i32, i32) {
     } else {
         (top, bottom)
     }
-}
-
-/// Diagnostic: the detected monitor arrangement and where the shared edge lands,
-/// as text for the GUI.
-pub fn layout_string(mac_side: Side) -> String {
-    use std::fmt::Write;
-    let v = virt_screen();
-    let mut s = String::new();
-    let _ = writeln!(s, "가상 화면: {}x{} at ({}, {})", v.w, v.h, v.x, v.y);
-    for (i, rc) in monitor_rects().iter().enumerate() {
-        let _ = writeln!(
-            s,
-            "모니터 {}: {}x{} at ({}, {})",
-            i,
-            rc.right - rc.left,
-            rc.bottom - rc.top,
-            rc.left,
-            rc.top
-        );
-    }
-    let (top, bottom) = edge_span(mac_side);
-    let _ = write!(
-        s,
-        "Mac 쪽 엣지 ({mac_side:?}): y {top}..{bottom} — 이 엣지를 넘으면 Mac으로 전환됩니다"
-    );
-    s
 }
 
 fn enter_remote(cursor: POINT) {

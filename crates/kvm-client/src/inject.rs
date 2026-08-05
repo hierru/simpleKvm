@@ -485,6 +485,14 @@ impl Injector {
     }
 }
 
+/// Display rects as (x, y, w, h) for the settings-UI arrangement map.
+pub fn ui_display_rects() -> Vec<(f32, f32, f32, f32)> {
+    active_display_rects()
+        .iter()
+        .map(|d| (d.x as f32, d.y as f32, d.w as f32, d.h as f32))
+        .collect()
+}
+
 /// Human-readable dump of the detected display arrangement, for the settings
 /// UI — lets the user compare against 시스템 설정 > 디스플레이 정렬.
 pub fn layout_string() -> String {
@@ -497,13 +505,17 @@ pub fn layout_string() -> String {
     for (i, d) in rects.iter().enumerate() {
         s.push_str(&format!(
             "디스플레이 {}: {:.0}x{:.0} @ ({:.0}, {:.0})\n",
-            i, d.w, d.h, d.x, d.y
+            i + 1,
+            d.w,
+            d.h,
+            d.x,
+            d.y
         ));
         if d.x <= min_x + 0.5 {
-            left_owners.push(i.to_string());
+            left_owners.push((i + 1).to_string());
         }
         if d.right() >= max_x - 0.5 {
-            right_owners.push(i.to_string());
+            right_owners.push((i + 1).to_string());
         }
     }
     s.push_str(&format!(

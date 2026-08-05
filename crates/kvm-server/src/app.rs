@@ -29,7 +29,6 @@ const OK: Color32 = Color32::from_rgb(70, 190, 120);
 pub struct App {
     cfg: ServerConfig,
     engine: Option<Engine>,
-    layout: Option<String>,
     notice: Option<String>,
     styled: bool,
     tray: Option<Tray>,
@@ -52,7 +51,6 @@ impl App {
         App {
             cfg,
             engine: None,
-            layout: None,
             notice: None,
             styled: false,
             tray,
@@ -193,6 +191,74 @@ fn card<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R)
             add(ui);
         });
     ui.add_space(14.0);
+}
+
+/// Windows-display-settings-style arrangement map: proportional rounded
+/// rectangles with big numbers. Monitors owning the shared (Mac-side) edge
+/// are filled with the accent color.
+fn monitor_map(ui: &mut egui::Ui, rects: &[(f32, f32, f32, f32)], mac_side: Option<Side>) {
+    if rects.is_empty() {
+        ui.label(RichText::new("모니터를 찾지 못했습니다.").size(12.0).color(MUTED));
+        return;
+    }
+    let min_x = rects.iter().map(|r| r.0).fold(f32::MAX, f32::min);
+    let min_y = rects.iter().map(|r| r.1).fold(f32::MAX, f32::min);
+    let max_x = rects.iter().map(|r| r.0 + r.2).fold(f32::MIN, f32::max);
+    let max_y = rects.iter().map(|r| r.1 + r.3).fold(f32::MIN, f32::max);
+    let world_w = (max_x - min_x).max(1.0);
+    let world_h = (max_y - min_y).max(1.0);
+
+    let pad = 12.0;
+    let avail = ui.available_width();
+    let scale = ((avail - pad * 2.0) / world_w).min(150.0 / world_h);
+    let (response, painter) = ui.allocate_painter(
+        egui::vec2(avail, world_h * scale + pad * 2.0),
+        egui::Sense::hover(),
+    );
+    let panel = response.rect;
+    painter.rect_filled(panel, CornerRadius::same(8), Color32::from_rgb(20, 21, 24));
+
+    let origin = egui::pos2(
+        panel.center().x - world_w * scale / 2.0,
+        panel.min.y + pad,
+    );
+    for (i, r) in rects.iter().enumerate() {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(origin.x + (r.0 - min_x) * scale, origin.y + (r.1 - min_y) * scale),
+            egui::vec2(r.2 * scale, r.3 * scale),
+        )
+        .shrink(2.5);
+        let owns_edge = match mac_side {
+            Some(Side::Left) => (r.0 - min_x).abs() < 0.5,
+            Some(Side::Right) => (r.0 + r.2 - max_x).abs() < 0.5,
+            None => false,
+        };
+        let fill = if owns_edge { ACCENT } else { Color32::from_rgb(44, 47, 53) };
+        painter.rect_filled(rect, CornerRadius::same(6), fill);
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(6),
+            Stroke::new(1.0, if owns_edge { ACCENT } else { CARD_STROKE }),
+            egui::StrokeKind::Inside,
+        );
+        let num_size = (rect.height() * 0.36).clamp(16.0, 34.0);
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            (i + 1).to_string(),
+            FontId::new(num_size, FontFamily::Proportional),
+            Color32::WHITE,
+        );
+        if rect.height() > 46.0 {
+            painter.text(
+                egui::pos2(rect.center().x, rect.bottom() - 6.0),
+                egui::Align2::CENTER_BOTTOM,
+                format!("{:.0}×{:.0}", r.2, r.3),
+                FontId::new(10.0, FontFamily::Proportional),
+                Color32::from_rgba_unmultiplied(255, 255, 255, 170),
+            );
+        }
+    }
 }
 
 fn status_badge(ui: &mut egui::Ui, color: Color32, text: &str) {
@@ -339,15 +405,18 @@ impl eframe::App for App {
                     }
 
                     ui.add_space(14.0);
-                    if ui.button("모니터 배치 보기").clicked() {
-                        self.layout = Some(hooks::layout_string(self.cfg.mac_side));
-                    }
-                    if let Some(layout) = &self.layout {
-                        ui.add_space(8.0);
-                        card(ui, "모니터 배치", |ui| {
-                            ui.label(RichText::new(layout).monospace().size(11.0).color(TEXT));
-                        });
-                    }
+                    card(ui, "모니터 배치", |ui| {
+                        monitor_map(ui, &hooks::ui_monitor_rects(), Some(self.cfg.mac_side));
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(
+                                "파란색 모니터의 바깥쪽 가장자리를 넘으면 Mac으로 전환됩니다. \
+                                 배치는 Windows 디스플레이 설정 기준입니다.",
+                            )
+                            .size(11.0)
+                            .color(MUTED),
+                        );
+                    });
 
                     ui.add_space(8.0);
                     self.status_pane(ui);

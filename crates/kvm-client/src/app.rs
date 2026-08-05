@@ -198,6 +198,68 @@ fn field(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(9.0);
 }
 
+/// macOS-display-settings-style arrangement map: proportional rounded
+/// rectangles with big numbers, drawn from the detected display bounds.
+fn display_map(ui: &mut egui::Ui, rects: &[(f32, f32, f32, f32)]) {
+    if rects.is_empty() {
+        ui.label(RichText::new("디스플레이를 찾지 못했습니다.").size(12.0).color(MUTED));
+        return;
+    }
+    let min_x = rects.iter().map(|r| r.0).fold(f32::MAX, f32::min);
+    let min_y = rects.iter().map(|r| r.1).fold(f32::MAX, f32::min);
+    let max_x = rects.iter().map(|r| r.0 + r.2).fold(f32::MIN, f32::max);
+    let max_y = rects.iter().map(|r| r.1 + r.3).fold(f32::MIN, f32::max);
+    let world_w = (max_x - min_x).max(1.0);
+    let world_h = (max_y - min_y).max(1.0);
+
+    let pad = 12.0;
+    let avail = ui.available_width();
+    let scale = ((avail - pad * 2.0) / world_w).min(150.0 / world_h);
+    let (response, painter) = ui.allocate_painter(
+        egui::vec2(avail, world_h * scale + pad * 2.0),
+        egui::Sense::hover(),
+    );
+    let panel = response.rect;
+    painter.rect_filled(panel, CornerRadius::same(8), Color32::from_rgb(20, 21, 24));
+
+    let origin = egui::pos2(panel.center().x - world_w * scale / 2.0, panel.min.y + pad);
+    for (i, r) in rects.iter().enumerate() {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(origin.x + (r.0 - min_x) * scale, origin.y + (r.1 - min_y) * scale),
+            egui::vec2(r.2 * scale, r.3 * scale),
+        )
+        .shrink(2.5);
+        // Display 1 (the main display, origin 0,0) gets the accent fill,
+        // mirroring how macOS highlights the primary display.
+        let is_main = r.0 == 0.0 && r.1 == 0.0;
+        let fill = if is_main { ACCENT } else { Color32::from_rgb(44, 47, 53) };
+        painter.rect_filled(rect, CornerRadius::same(6), fill);
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(6),
+            Stroke::new(1.0, if is_main { ACCENT } else { CARD_STROKE }),
+            egui::StrokeKind::Inside,
+        );
+        let num_size = (rect.height() * 0.36).clamp(16.0, 34.0);
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            (i + 1).to_string(),
+            FontId::new(num_size, FontFamily::Proportional),
+            Color32::WHITE,
+        );
+        if rect.height() > 46.0 {
+            painter.text(
+                egui::pos2(rect.center().x, rect.bottom() - 6.0),
+                egui::Align2::CENTER_BOTTOM,
+                format!("{:.0}×{:.0}", r.2, r.3),
+                FontId::new(10.0, FontFamily::Proportional),
+                Color32::from_rgba_unmultiplied(255, 255, 255, 170),
+            );
+        }
+    }
+}
+
 fn status_badge(ui: &mut egui::Ui, color: Color32, text: &str) {
     egui::Frame::NONE
         .fill(Color32::from_rgb(40, 43, 49))
@@ -391,15 +453,32 @@ impl eframe::App for App {
                 }
 
                 ui.add_space(14.0);
-                if ui.button("디스플레이 배치 보기").clicked() {
-                    self.layout = Some(crate::inject::layout_string());
-                }
-                if let Some(layout) = &self.layout {
-                    ui.add_space(8.0);
-                    card(ui, "디스플레이 배치", |ui| {
+                card(ui, "디스플레이 배치", |ui| {
+                    display_map(ui, &crate::inject::ui_display_rects());
+                    ui.add_space(6.0);
+                    if ui
+                        .button(RichText::new("상세 좌표 보기").size(11.0))
+                        .clicked()
+                    {
+                        self.layout = match self.layout {
+                            Some(_) => None,
+                            None => Some(crate::inject::layout_string()),
+                        };
+                    }
+                    if let Some(layout) = &self.layout {
+                        ui.add_space(4.0);
                         ui.label(RichText::new(layout).monospace().size(11.0).color(TEXT));
-                    });
-                }
+                    }
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "시스템 설정 → 디스플레이 정렬과 같아야 합니다. 다르면 이 화면을 \
+                             캡처해서 알려주세요.",
+                        )
+                        .size(11.0)
+                        .color(MUTED),
+                    );
+                });
 
                 ui.add_space(8.0);
                 self.status_pane(ui);

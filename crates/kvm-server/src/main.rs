@@ -23,8 +23,13 @@ fn main() -> eframe::Result<()> {
     // Single-instance guard: hold a fixed loopback port for our lifetime. A
     // second copy would fail to bind 24800 anyway ("bind 실패: 10048") but only
     // after the user clicks start — surface it clearly at launch instead.
-    let _lock = match std::net::TcpListener::bind(("127.0.0.1", 24798)) {
-        Ok(l) => l,
+    // KVM_ALLOW_SECOND skips the guard for development (e.g. previewing UI
+    // changes while a real server is running).
+    let _lock = if std::env::var_os("KVM_ALLOW_SECOND").is_some() {
+        None
+    } else {
+        match std::net::TcpListener::bind(("127.0.0.1", 24798)) {
+        Ok(l) => Some(l),
         Err(_) => {
             unsafe {
                 use windows::core::w;
@@ -40,6 +45,7 @@ fn main() -> eframe::Result<()> {
                 );
             }
             return Ok(());
+        }
         }
     };
 
