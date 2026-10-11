@@ -9,11 +9,13 @@
 //! from that center and the cursor is snapped back. Events injected by our own
 //! `SetCursorPos` carry `LLMHF_INJECTED` and are passed through untouched.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 
 use kvm_protocol::{Message, MouseButton, Side};
+
+use crate::applog;
 use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, HDC, HMONITOR, MONITORINFO,
@@ -48,6 +50,13 @@ pub static CONNECTED: AtomicBool = AtomicBool::new(false);
 /// True while input is being forwarded to the client.
 pub static REMOTE: AtomicBool = AtomicBool::new(false);
 
+// 진단 카운터: 훅이 실제로 받은 물리 입력 이벤트 수, 클라이언트로 보낸 메시지 수,
+// SetCursorPos 실패 수. diag 샘플러가 주기적으로 읽고 0으로 되돌린다.
+pub static MOUSE_EVENTS: AtomicU64 = AtomicU64::new(0);
+pub static KEY_EVENTS: AtomicU64 = AtomicU64::new(0);
+pub static SENT_MESSAGES: AtomicU64 = AtomicU64::new(0);
+pub static SETCURSOR_FAILS: AtomicU64 = AtomicU64::new(0);
+
 fn side_to_i32(s: Side) -> i32 {
     match s {
         Side::Left => 0,
@@ -55,7 +64,7 @@ fn side_to_i32(s: Side) -> i32 {
     }
 }
 
-fn mac_side() -> Side {
+pub(crate) fn mac_side() -> Side {
     if MAC_SIDE.load(Ordering::Relaxed) == 1 {
         Side::Right
     } else {
@@ -84,18 +93,30 @@ pub fn clear() {
 fn send(msg: Message) {
     if let Some(tx) = TX.lock().unwrap().as_ref() {
         let _ = tx.send(msg);
+        SENT_MESSAGES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// SetCursorPos 래퍼: 실패를 세고, 첫 실패만 즉시 로그에 남긴다 (이후는 샘플러가 집계).
+/// 상위 권한·안티치트 보호 창이 활성일 때 실패할 수 있다.
+fn set_cursor(x: i32, y: i32) {
+    if let Err(e) = unsafe { SetCursorPos(x, y) } {
+        let n = SETCURSOR_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 {
+            applog::write(format!("SetCursorPos 실패 (첫 발생): ({x},{y}) {e}"));
+        }
     }
 }
 
 #[derive(Clone, Copy)]
-struct VirtScreen {
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
+pub(crate) struct VirtScreen {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
 }
 
-fn virt_screen() -> VirtScreen {
+pub(crate) fn virt_screen() -> VirtScreen {
     unsafe {
         VirtScreen {
             x: GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -203,10 +224,11 @@ fn enter_remote(cursor: POINT) {
 
     REMOTE.store(true, Ordering::SeqCst);
     send(Message::Enter { edge: side.opposite(), y_ratio });
-    unsafe {
-        let _ = SetCursorPos(cx, cy);
-    }
-    println!("-> control moved to the Mac");
+    set_cursor(cx, cy);
+    applog::write(format!(
+        "원격 진입: 커서=({},{}) y비율={y_ratio:.3} 파킹=({cx},{cy})",
+        cursor.x, cursor.y
+    ));
 }
 
 /// Reclaim local control. `y_ratio` positions the cursor next to the shared
@@ -228,10 +250,11 @@ pub fn leave_remote(y_ratio: Option<f32>, notify: bool) {
         Side::Left => v.x + 5,
         Side::Right => v.x + v.w - 6,
     };
-    unsafe {
-        let _ = SetCursorPos(x, y.clamp(span_top, span_bottom - 1));
-    }
-    println!("<- control back on Windows");
+    set_cursor(x, y.clamp(span_top, span_bottom - 1));
+    applog::write(format!(
+        "원격 복귀: 사유={} 복귀위치=({x},{y})",
+        if notify { "핫키/서버" } else { "클라이언트 엣지/연결 종료" }
+    ));
 }
 
 unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -244,6 +267,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
     }
     let msg = wparam.0 as u32;
+    MOUSE_EVENTS.fetch_add(1, Ordering::Relaxed);
 
     if REMOTE.load(Ordering::SeqCst) {
         match msg {
@@ -254,7 +278,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 let dy = info.pt.y - cy;
                 if dx != 0 || dy != 0 {
                     send(Message::MouseMove { dx, dy });
-                    let _ = SetCursorPos(cx, cy);
+                    set_cursor(cx, cy);
                 }
             }
             WM_LBUTTONDOWN => send(Message::MouseButton { button: MouseButton::Left, pressed: true }),
@@ -308,6 +332,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     if info.flags.0 & LLKHF_INJECTED.0 != 0 {
         return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
     }
+    KEY_EVENTS.fetch_add(1, Ordering::Relaxed);
 
     if REMOTE.load(Ordering::SeqCst) {
         let msg = wparam.0 as u32;
@@ -356,7 +381,8 @@ pub fn install_and_run() -> bool {
         let mouse_hook =
             match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), HINSTANCE::default(), 0) {
                 Ok(h) => h,
-                Err(_) => {
+                Err(e) => {
+                    applog::write(format!("마우스 훅 설치 실패: {e}"));
                     HOOK_THREAD_ID.store(0, Ordering::SeqCst);
                     return false;
                 }
@@ -364,12 +390,14 @@ pub fn install_and_run() -> bool {
         let kbd_hook =
             match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), HINSTANCE::default(), 0) {
                 Ok(h) => h,
-                Err(_) => {
+                Err(e) => {
+                    applog::write(format!("키보드 훅 설치 실패: {e}"));
                     let _ = UnhookWindowsHookEx(mouse_hook);
                     HOOK_THREAD_ID.store(0, Ordering::SeqCst);
                     return false;
                 }
             };
+        applog::write("훅 설치 완료 (마우스·키보드 LL 훅)");
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
@@ -380,6 +408,7 @@ pub fn install_and_run() -> bool {
         HOOK_THREAD_ID.store(0, Ordering::SeqCst);
         let _ = UnhookWindowsHookEx(mouse_hook);
         let _ = UnhookWindowsHookEx(kbd_hook);
+        applog::write("훅 해제 (메시지 루프 종료)");
         true
     }
 }

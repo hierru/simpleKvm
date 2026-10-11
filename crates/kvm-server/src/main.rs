@@ -12,6 +12,8 @@ mod applog;
 #[cfg(windows)]
 mod autostart;
 #[cfg(windows)]
+mod diag;
+#[cfg(windows)]
 mod engine;
 #[cfg(windows)]
 mod hooks;

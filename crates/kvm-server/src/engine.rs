@@ -17,6 +17,7 @@ pub struct Engine {
     stop: Arc<AtomicBool>,
     hook_thread: Option<JoinHandle<()>>,
     net_thread: Option<JoinHandle<()>>,
+    diag_thread: Option<JoinHandle<()>>,
     mdns: Option<mdns_sd::ServiceDaemon>,
     pub status: Arc<Mutex<ServerStatus>>,
 }
@@ -36,10 +37,18 @@ impl Engine {
             std::thread::spawn(move || net::run(port, rx, name, mac_side, status, stop, clip))
         };
 
-        // Low-level hooks must be installed and pumped on their own thread.
+        // 저수준 훅은 전용 스레드에서 설치하고 그 스레드가 메시지 루프를 돌려야 한다.
         let hook_thread = std::thread::spawn(|| {
-            let _ = hooks::install_and_run();
+            if !hooks::install_and_run() {
+                crate::applog::write("⚠ 훅 설치 실패 — 입력 캡처가 동작하지 않습니다");
+            }
         });
+
+        // 진단 샘플러 (커서 클립·포그라운드·훅 수신 통계를 server.log에 기록)
+        let diag_thread = {
+            let stop = stop.clone();
+            std::thread::spawn(move || crate::diag::run(stop))
+        };
 
         let mdns = advertise_mdns(cfg, &status);
 
@@ -47,6 +56,7 @@ impl Engine {
             stop,
             hook_thread: Some(hook_thread),
             net_thread: Some(net_thread),
+            diag_thread: Some(diag_thread),
             mdns,
             status,
         }
@@ -64,6 +74,9 @@ impl Engine {
         }
         if let Some(n) = self.net_thread.take() {
             let _ = n.join();
+        }
+        if let Some(d) = self.diag_thread.take() {
+            let _ = d.join();
         }
     }
 }
