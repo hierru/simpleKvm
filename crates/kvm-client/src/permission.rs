@@ -17,7 +17,24 @@ pub fn is_trusted() -> bool {
 
 /// Open System Settings at Privacy & Security → Accessibility.
 pub fn open_settings() {
+    open_pane("com.apple.preference.security?Privacy_Accessibility");
+}
+
+/// Open System Settings at Privacy & Security → Local Network.
+///
+/// There is no counterpart to `AXIsProcessTrusted` for this permission: it is
+/// enforced by a Network Extension packet filter rather than TCC, and Apple
+/// exposes no way to read its state without triggering the request. Probing it
+/// functionally (browse mDNS and see whether anything answers) was tried and
+/// rejected — the same bundle, at the same grant state, produced both "nothing
+/// found" and "resolved fine" minutes apart. So the UI links here instead of
+/// claiming a verdict it cannot support.
+pub fn open_local_network_settings() {
+    open_pane("com.apple.settings.PrivacySecurity.extension?Privacy_LocalNetwork");
+}
+
+fn open_pane(url: &str) {
     let _ = std::process::Command::new("open")
-        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        .arg(format!("x-apple.systempreferences:{url}"))
         .status();
 }

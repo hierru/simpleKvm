@@ -2,6 +2,7 @@
 //! Runs for the app's lifetime; the settings UI reads `servers` each frame.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use kvm_protocol::MDNS_SERVICE_TYPE;
 use mdns_sd::{ServiceDaemon, ServiceEvent};
@@ -19,6 +20,12 @@ pub struct DiscoveredServer {
 pub struct Discovery {
     daemon: ServiceDaemon,
     pub servers: Arc<Mutex<Vec<DiscoveredServer>>>,
+    /// When we last received *any* mDNS event for our service type. Reported
+    /// as-is in the diagnostics pane: it says traffic is arriving, nothing
+    /// more. It is deliberately NOT used to judge the Local Network
+    /// permission — a browse that returns nothing has been observed both with
+    /// and without that permission, so it cannot tell the two apart.
+    pub last_event: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Discovery {
@@ -26,12 +33,25 @@ impl Discovery {
         let daemon = ServiceDaemon::new().ok()?;
         let rx = daemon.browse(MDNS_SERVICE_TYPE).ok()?;
         let servers: Arc<Mutex<Vec<DiscoveredServer>>> = Arc::new(Mutex::new(Vec::new()));
+        let last_event: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
         {
             let servers = servers.clone();
+            let last_event = last_event.clone();
             // Exits when the daemon shuts down (recv starts failing).
             std::thread::spawn(move || {
                 while let Ok(event) = rx.recv() {
+                    // Only responses count. `SearchStarted` fires on every
+                    // query round even when the LAN answers with nothing, so
+                    // stamping it would make "last heard" always look fresh.
+                    if matches!(
+                        event,
+                        ServiceEvent::ServiceFound(..)
+                            | ServiceEvent::ServiceResolved(..)
+                            | ServiceEvent::ServiceRemoved(..)
+                    ) {
+                        *last_event.lock().unwrap() = Some(Instant::now());
+                    }
                     match event {
                         ServiceEvent::ServiceResolved(info) => {
                             let addrs = info.get_addresses();
@@ -69,7 +89,7 @@ impl Discovery {
             });
         }
 
-        Some(Discovery { daemon, servers })
+        Some(Discovery { daemon, servers, last_event })
     }
 }
 

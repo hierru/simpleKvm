@@ -49,6 +49,7 @@ pub struct App {
     first_frame: bool,
     discovery: Option<crate::discovery::Discovery>,
     layout: Option<String>,
+    build: crate::buildinfo::BuildStamp,
 }
 
 impl App {
@@ -72,6 +73,7 @@ impl App {
             first_frame: true,
             discovery: crate::discovery::Discovery::start(),
             layout: None,
+            build: crate::buildinfo::BuildStamp::capture(),
         }
     }
 
@@ -127,6 +129,92 @@ impl App {
                 self.set_autostart(target);
             }
         }
+    }
+
+    /// Permissions and running-image diagnostics.
+    ///
+    /// Accessibility is checked exactly. Local Network deliberately shows no
+    /// verdict: macOS exposes no API to read it, and judging it by "did an
+    /// mDNS browse find anything" was measured to be unreliable — the same
+    /// bundle at the same grant state produced both nothing-found and
+    /// resolved-fine minutes apart. Raw observations are shown instead, so a
+    /// wrong guess is never presented as a diagnosis.
+    fn diagnostics_card(&self, ui: &mut egui::Ui) {
+        let trusted = permission::is_trusted();
+        let (found, last_heard) = match &self.discovery {
+            Some(d) => (
+                d.servers.lock().unwrap().len(),
+                d.last_event.lock().unwrap().map(|t| t.elapsed()),
+            ),
+            None => (0, None),
+        };
+
+        card(ui, "권한 및 진단", |ui| {
+            perm_row(
+                ui,
+                "손쉬운 사용",
+                if trusted { (OK, "허용됨") } else { (DANGER, "권한 필요") },
+                if trusted {
+                    "마우스·키보드 주입이 가능한 상태입니다."
+                } else {
+                    "없으면 연결되어도 입력이 Mac에 주입되지 않습니다."
+                },
+            );
+            if ui.small_button("손쉬운 사용 설정 열기").clicked() {
+                permission::open_settings();
+            }
+
+            ui.add_space(11.0);
+            ui.separator();
+            ui.add_space(11.0);
+
+            perm_row(
+                ui,
+                "로컬 네트워크",
+                (MUTED, "자동 확인 불가"),
+                "macOS가 이 권한의 상태를 읽는 API를 제공하지 않습니다. \
+                 아래는 판정이 아니라 관측값입니다.",
+            );
+            ui.label(
+                RichText::new(format!("· mDNS로 발견된 서버: {found}개"))
+                    .size(11.0)
+                    .color(TEXT),
+            );
+            ui.label(
+                RichText::new(match last_heard {
+                    Some(d) => format!("· 마지막 mDNS 응답: {}초 전", d.as_secs()),
+                    None => "· 마지막 mDNS 응답: 아직 없음".into(),
+                })
+                .size(11.0)
+                .color(TEXT),
+            );
+            ui.add_space(7.0);
+            if ui.small_button("로컬 네트워크 설정 열기").clicked() {
+                permission::open_local_network_settings();
+            }
+
+            ui.add_space(11.0);
+            ui.separator();
+            ui.add_space(11.0);
+
+            ui.label(
+                RichText::new(format!(
+                    "실행 중인 빌드: {} · {}",
+                    self.build.built_at,
+                    crate::buildinfo::BuildStamp::commit()
+                ))
+                .size(11.0)
+                .color(MUTED),
+            );
+            if self.build.superseded() {
+                ui.add_space(5.0);
+                ui.label(
+                    RichText::new("● 더 새 빌드가 설치되었습니다. 앱을 재시작해야 반영됩니다.")
+                        .size(11.0)
+                        .color(WARN),
+                );
+            }
+        });
     }
 
     fn connection_badge(&self) -> (Color32, &'static str) {
@@ -189,6 +277,19 @@ fn card<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R)
             add(ui);
         });
     ui.add_space(14.0);
+}
+
+/// One permission line: name on the left, state chip on the right, note below.
+fn perm_row(ui: &mut egui::Ui, name: &str, state: (Color32, &str), note: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(name).size(13.0).strong().color(TEXT));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new(state.1).size(11.0).strong().color(state.0));
+        });
+    });
+    ui.add_space(3.0);
+    ui.label(RichText::new(note).size(11.0).color(MUTED));
+    ui.add_space(7.0);
 }
 
 /// A label above a full-width input.
@@ -667,6 +768,8 @@ impl eframe::App for App {
                         );
                     }
                 });
+
+                self.diagnostics_card(ui);
 
                 ui.add_space(8.0);
                 self.status_pane(ui);

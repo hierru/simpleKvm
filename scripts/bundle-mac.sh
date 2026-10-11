@@ -34,6 +34,19 @@ if command -v codesign >/dev/null 2>&1; then
   fi
 fi
 
+# Replacing the binary does not touch a process that is already running: it
+# keeps its original image, so the rebundle silently has no effect until the
+# app is relaunched. Restart it here rather than leaving a stale copy running.
+if pgrep -f "${BUNDLE}/Contents/MacOS/kvm-client" >/dev/null 2>&1; then
+  echo "==> restarting the running app"
+  pkill -f "${BUNDLE}/Contents/MacOS/kvm-client" || true
+  for _ in $(seq 1 20); do
+    pgrep -f "${BUNDLE}/Contents/MacOS/kvm-client" >/dev/null 2>&1 || break
+    sleep 0.25
+  done
+  open "${BUNDLE}"
+fi
+
 echo "==> done: ${BUNDLE}"
 echo "Open with:  open ${BUNDLE}"
-echo "First run: grant System Settings > Privacy & Security > Accessibility."
+echo "Permissions: see docs/permissions.md (Accessibility + Local Network)."

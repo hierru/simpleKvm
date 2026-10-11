@@ -17,6 +17,8 @@ mod app;
 #[cfg(target_os = "macos")]
 mod autostart;
 #[cfg(target_os = "macos")]
+mod buildinfo;
+#[cfg(target_os = "macos")]
 mod discovery;
 #[cfg(target_os = "macos")]
 mod inject;
