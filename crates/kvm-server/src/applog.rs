@@ -33,7 +33,9 @@ pub fn write(line: impl AsRef<str>) {
     if std::fs::metadata(&p).map(|m| m.len() > MAX_BYTES).unwrap_or(false) {
         let _ = std::fs::rename(&p, p.with_extension("log.old"));
     }
+    // 한 줄을 통째로 한 번에 쓴다: 여러 스레드가 동시에 기록해도 줄이 서로 섞이지 않도록.
+    let full = format!("{} {}\n", timestamp(), line.as_ref());
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
-        let _ = writeln!(f, "{} {}", timestamp(), line.as_ref());
+        let _ = f.write_all(full.as_bytes());
     }
 }
