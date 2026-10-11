@@ -9,8 +9,25 @@ use std::process::Command;
 fn main() {
     println!("cargo:rustc-env=KVM_BUILD_COMMIT={}", commit());
     // Keep the stamp honest: re-run when HEAD moves or any source changes.
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    // `.git/HEAD` alone is not enough: on a branch it just says
+    // `ref: refs/heads/main`, so a new commit never touches it. Watch the
+    // branch ref (and packed-refs, where it may live) plus the index, which
+    // changes on commit and so clears a stale `+dirty`.
+    for path in watched_git_paths() {
+        println!("cargo:rerun-if-changed={path}");
+    }
     println!("cargo:rerun-if-changed=src");
+}
+
+fn watched_git_paths() -> Vec<String> {
+    let mut names = vec!["HEAD".to_string(), "packed-refs".into(), "index".into()];
+    if let Some(branch_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        names.push(branch_ref);
+    }
+    names
+        .iter()
+        .filter_map(|n| git(&["rev-parse", "--path-format=absolute", "--git-path", n]))
+        .collect()
 }
 
 fn commit() -> String {
