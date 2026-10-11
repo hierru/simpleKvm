@@ -2128,6 +2128,7 @@ dependencies = [
  "eframe",
  "kvm-protocol",
  "mdns-sd",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "tray-icon",

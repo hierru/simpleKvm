@@ -8,6 +8,8 @@ mod config;
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
+mod applog;
+#[cfg(windows)]
 mod autostart;
 #[cfg(windows)]
 mod engine;
@@ -61,17 +63,22 @@ fn main() -> eframe::Result<()> {
 
     // Autostarted copies launch with --minimized and come up in the tray only.
     let start_hidden = std::env::args().any(|a| a == "--minimized");
+    applog::write(format!(
+        "startup: args={:?} hidden={start_hidden}",
+        std::env::args().skip(1).collect::<Vec<_>>()
+    ));
 
     // The window is controlled from the tray, so it skips the taskbar. Hidden
-    // means moved far off-screen: eframe stops calling `ui` for a window made
-    // Visible(false), which would deadlock re-showing (see the client app).
+    // is a real OS hide (not an off-screen position): while hidden egui does
+    // not repaint, so the tray handlers below re-show the window through
+    // Win32 directly, after which the egui loop resumes and drains the queue.
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_inner_size([440.0, 600.0])
         .with_min_inner_size([380.0, 460.0])
         .with_title("simpleKvm 서버")
         .with_taskbar(false);
     if start_hidden {
-        viewport = viewport.with_position([12000.0, 12000.0]);
+        viewport = viewport.with_visible(false);
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
 
@@ -79,16 +86,23 @@ fn main() -> eframe::Result<()> {
         "simpleKvm 서버",
         options,
         Box::new(move |cc| {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
             use std::sync::{Arc, Mutex};
 
             install_korean_font(&cc.egui_ctx);
 
             let autostart_on = autostart::is_enabled();
             let tray = tray::Tray::build(autostart_on);
+            applog::write(format!("tray built: {}", tray.is_some()));
 
-            // Raw window handle so tray handlers can drag the window back
-            // on-screen even if the hidden window stopped repainting.
-            let hwnd = find_own_hwnd();
+            // The real window handle from eframe, so tray handlers can show
+            // the window even while it is hidden/minimized and not repainting.
+            let hwnd: isize = match cc.window_handle().map(|h| h.as_raw()) {
+                Ok(RawWindowHandle::Win32(h)) => h.hwnd.get() as isize,
+                Ok(_) => 0,
+                Err(_) => 0,
+            };
+            applog::write(format!("window handle: {hwnd:#x}"));
 
             // Route menu clicks into a queue the app drains each frame.
             let queue: Arc<Mutex<Vec<tray_icon::menu::MenuId>>> =
@@ -96,16 +110,25 @@ fn main() -> eframe::Result<()> {
             {
                 let q = queue.clone();
                 let ctx = cc.egui_ctx.clone();
-                let open_id = tray.as_ref().map(|t| t.open_id.clone());
-                let quit_id = tray.as_ref().map(|t| t.quit_id.clone());
+                let autostart_id = tray.as_ref().map(|t| t.autostart_id.clone());
                 tray_icon::menu::MenuEvent::set_event_handler(Some(
                     move |ev: tray_icon::menu::MenuEvent| {
-                        let bring_up = Some(&ev.id) == open_id.as_ref()
-                            || Some(&ev.id) == quit_id.as_ref();
-                        q.lock().unwrap().push(ev.id);
-                        if bring_up {
+                        applog::write(format!("tray menu: {:?}", ev.id));
+                        if Some(&ev.id) == autostart_id.as_ref() {
+                            // Toggle here, not in the app: the app may not be
+                            // running while the window is hidden. The app
+                            // re-reads the registry when it drains the queue.
+                            let target = !autostart::is_enabled();
+                            match autostart::set(target) {
+                                Ok(()) => applog::write(format!("autostart -> {target}")),
+                                Err(e) => applog::write(format!("autostart set failed: {e}")),
+                            }
+                        } else {
+                            // open / quit: show the window first so the egui
+                            // loop resumes and processes the request.
                             force_show_window(hwnd);
                         }
+                        q.lock().unwrap().push(ev.id);
                         ctx.request_repaint();
                     },
                 ));
@@ -117,6 +140,7 @@ fn main() -> eframe::Result<()> {
                 tray_icon::TrayIconEvent::set_event_handler(Some(
                     move |ev: tray_icon::TrayIconEvent| {
                         if let tray_icon::TrayIconEvent::DoubleClick { .. } = ev {
+                            applog::write("tray double-click");
                             if let Some(id) = &open_id {
                                 q.lock().unwrap().push(id.clone());
                             }
@@ -127,39 +151,30 @@ fn main() -> eframe::Result<()> {
                 ));
             }
 
-            Ok(Box::new(app::App::new(cfg, tray, queue, autostart_on, start_hidden)))
+            Ok(Box::new(app::App::new(cfg, tray, queue, autostart_on, start_hidden, hwnd)))
         }),
     )
 }
 
-/// HWND of our main window (found by its unique title), as a Send-able isize.
-/// 0 if not found.
-#[cfg(windows)]
-fn find_own_hwnd() -> isize {
-    use windows::core::w;
-    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
-    unsafe {
-        FindWindowW(windows::core::PCWSTR::null(), w!("simpleKvm 서버"))
-            .map(|h| h.0 as isize)
-            .unwrap_or(0)
-    }
-}
-
-/// Move the window on-screen and focus it, bypassing egui (used from tray
-/// handlers, which may fire while the off-screen window is not repainting).
+/// Show (and un-minimize) the window through Win32, bypassing egui — used
+/// from tray handlers, which fire while a hidden or minimized window is not
+/// repainting and therefore cannot process viewport commands itself.
 #[cfg(windows)]
 fn force_show_window(hwnd: isize) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        SetForegroundWindow, SetWindowPos, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+        IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
     };
     if hwnd == 0 {
+        applog::write("force_show_window: no window handle");
         return;
     }
     unsafe {
         let h = HWND(hwnd as *mut _);
-        let _ = SetWindowPos(h, HWND::default(), 120, 120, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW);
+        let minimized = IsIconic(h).as_bool();
+        let _ = ShowWindow(h, if minimized { SW_RESTORE } else { SW_SHOW });
         let _ = SetForegroundWindow(h);
+        applog::write(format!("force_show_window: shown (was minimized: {minimized})"));
     }
 }
 

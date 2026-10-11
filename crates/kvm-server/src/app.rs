@@ -8,14 +8,12 @@ use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Margin, Pos2
 use kvm_protocol::Side;
 use tray_icon::menu::MenuId;
 
+use crate::applog;
 use crate::autostart;
 use crate::config::ServerConfig;
 use crate::engine::Engine;
 use crate::hooks;
 use crate::tray::{Tray, TrayState};
-
-const DEFAULT_POS: Pos2 = Pos2::new(120.0, 120.0);
-const OFFSCREEN: Pos2 = Pos2::new(12000.0, 12000.0);
 
 const BG: Color32 = Color32::from_rgb(24, 25, 28);
 const CARD: Color32 = Color32::from_rgb(33, 35, 40);
@@ -38,6 +36,8 @@ pub struct App {
     shown_pos: Option<Pos2>,
     last_tray_state: Option<TrayState>,
     first_frame: bool,
+    /// Raw HWND of our window (0 if unavailable), for Win32 show/restore.
+    hwnd: isize,
 }
 
 impl App {
@@ -47,6 +47,7 @@ impl App {
         menu_queue: Arc<Mutex<Vec<MenuId>>>,
         autostart_on: bool,
         start_hidden: bool,
+        hwnd: isize,
     ) -> Self {
         let mut app = App {
             cfg,
@@ -60,6 +61,7 @@ impl App {
             shown_pos: None,
             last_tray_state: None,
             first_frame: true,
+            hwnd,
         };
         // An autostarted (tray-only) server should serve without requiring the
         // user to open the window and click start.
@@ -71,28 +73,43 @@ impl App {
 
     fn start(&mut self) {
         self.notice = self.cfg.save().err().map(|e| format!("설정 저장 실패: {e}"));
+        applog::write(format!(
+            "engine start: port={} mac_side={:?}",
+            self.cfg.port, self.cfg.mac_side
+        ));
         self.engine = Some(Engine::start(&self.cfg));
     }
 
     fn stop(&mut self) {
         if let Some(mut e) = self.engine.take() {
+            applog::write("engine stop");
             e.stop();
         }
     }
 
+    /// Show the window: un-hide, un-minimize, restore its last position and
+    /// focus it. Also pokes Win32 directly, because a hidden or minimized
+    /// window may not have been repainting (so viewport commands alone could
+    /// not have reached it).
     fn show(&mut self, ctx: &egui::Context) {
         self.hidden = false;
-        let pos = self.shown_pos.unwrap_or(DEFAULT_POS);
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+        crate::force_show_window(self.hwnd);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        if let Some(pos) = self.shown_pos {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        applog::write("window shown");
     }
 
-    /// "Hidden" = moved far off-screen so the event loop keeps running (see
-    /// main.rs); the tray brings it back.
+    /// Hide to the tray: a real OS hide. egui stops repainting while hidden;
+    /// the tray handlers in main.rs re-show through Win32, which resumes it.
     fn hide(&mut self, ctx: &egui::Context) {
         self.hidden = true;
         self.shown_pos = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min));
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(OFFSCREEN));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        applog::write("window hidden to tray");
     }
 
     fn set_autostart(&mut self, enabled: bool) {
@@ -116,11 +133,17 @@ impl App {
             if id == open {
                 self.show(ctx);
             } else if id == quit {
+                applog::write("quit from tray");
                 self.stop();
                 std::process::exit(0);
             } else if id == auto {
-                let target = !self.autostart_on;
-                self.set_autostart(target);
+                // The tray handler already toggled the registry (it runs even
+                // while this loop is stalled); just resync our view of it.
+                let on = autostart::is_enabled();
+                self.autostart_on = on;
+                if let Some(t) = &self.tray {
+                    t.set_autostart_checked(on);
+                }
             }
         }
     }
