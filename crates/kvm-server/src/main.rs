@@ -14,6 +14,8 @@ mod autostart;
 #[cfg(windows)]
 mod diag;
 #[cfg(windows)]
+mod elevate;
+#[cfg(windows)]
 mod engine;
 #[cfg(windows)]
 mod hooks;
@@ -24,6 +26,27 @@ mod tray;
 
 #[cfg(windows)]
 fn main() -> eframe::Result<()> {
+    // 관리자 권한 확보: 일반 권한이면 UAC로 자기 자신을 재실행하고 이 프로세스는 끝낸다.
+    // (게임 등 관리자 권한 창이 활성일 때도 훅이 입력을 받으려면 필요 — elevate.rs 참고)
+    let elevated = elevate::is_elevated();
+    applog::write(format!("권한: {}", if elevated { "관리자" } else { "일반" }));
+    if !elevated && std::env::var_os("KVM_NO_ELEVATE").is_none() {
+        if elevate::relaunch_elevated() {
+            return Ok(());
+        }
+        unsafe {
+            use windows::core::w;
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
+            MessageBoxW(
+                HWND::default(),
+                w!("관리자 권한이 거부되어 일반 권한으로 계속합니다.\n게임 등 관리자 권한으로 실행된 창이 활성일 때는 KVM이 동작하지 않을 수 있습니다."),
+                w!("simpleKvm"),
+                MB_OK | MB_ICONWARNING,
+            );
+        }
+    }
+
     // Single-instance guard: hold a fixed loopback port for our lifetime. A
     // second copy would fail to bind 24800 anyway ("bind 실패: 10048") but only
     // after the user clicks start — surface it clearly at launch instead.

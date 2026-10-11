@@ -1,96 +1,121 @@
-//! Run-at-login via the per-user registry key
-//! HKCU\Software\Microsoft\Windows\CurrentVersion\Run (value "simpleKvm").
+//! Windows 시작(로그온) 시 자동 실행 — 작업 스케줄러 방식.
 //!
-//! The stored command launches this binary with `--minimized`, so an
-//! autostarted server comes up quietly in the tray.
+//! 서버는 관리자 권한을 요구하므로(build.rs 매니페스트) 레지스트리 Run 항목으로는
+//! 시작할 수 없다(Windows가 상승 필요한 앱의 Run 항목을 차단). 대신 "로그온 시,
+//! 최고 권한"으로 등록한 예약 작업은 UAC 확인창 없이 자동 실행된다.
+//! 등록되는 명령은 이 실행 파일에 `--minimized`를 붙인 것(트레이로 조용히 시작).
+//!
+//! 예전 버전이 남긴 HKCU\...\Run 항목은 설정 변경 시 함께 제거한다.
+
+use std::os::windows::process::CommandExt;
+use std::process::Command;
 
 use windows::core::PCWSTR;
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SAM_FLAGS, REG_SZ,
+    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
 };
 
-const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const VALUE_NAME: &str = "simpleKvm";
+use crate::applog;
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+const TASK_NAME: &str = "simpleKvm Server";
+const LEGACY_RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const LEGACY_VALUE_NAME: &str = "simpleKvm";
+/// 콘솔 창이 깜빡이지 않도록 (CREATE_NO_WINDOW).
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// The command to relaunch at login (this binary, minimized to the tray).
-fn command() -> String {
-    let exe = std::env::current_exe()
+fn exe_path() -> String {
+    std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(str::to_owned))
-        .unwrap_or_default();
-    format!("\"{exe}\" --minimized")
+        .unwrap_or_default()
 }
 
-fn open_run_key(sam: REG_SAM_FLAGS) -> Option<HKEY> {
-    let sub = wide(RUN_KEY);
-    let mut key = HKEY::default();
-    let err = unsafe {
-        RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(sub.as_ptr()), 0, sam, &mut key)
-    };
-    err.is_ok().then_some(key)
+fn schtasks(args: &[&str]) -> std::io::Result<(bool, String)> {
+    let out = Command::new("schtasks.exe")
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok((out.status.success(), text.trim().to_string()))
 }
 
 pub fn is_enabled() -> bool {
-    let Some(key) = open_run_key(KEY_QUERY_VALUE) else {
-        return false;
-    };
-    let name = wide(VALUE_NAME);
-    let err = unsafe { RegQueryValueExW(key, PCWSTR(name.as_ptr()), None, None, None, None) };
-    unsafe {
-        let _ = RegCloseKey(key);
-    }
-    err.is_ok()
+    matches!(schtasks(&["/Query", "/TN", TASK_NAME]), Ok((true, _)))
 }
 
 pub fn set(enabled: bool) -> std::io::Result<()> {
-    let Some(key) = open_run_key(KEY_SET_VALUE) else {
-        return Err(std::io::Error::other("Run 레지스트리 키를 열 수 없습니다"));
-    };
-    let name = wide(VALUE_NAME);
-    let result = if enabled {
-        let data = wide(&command());
-        // REG_SZ payload is the UTF-16 string bytes including the terminator.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2)
-        };
-        let err = unsafe { RegSetValueExW(key, PCWSTR(name.as_ptr()), 0, REG_SZ, Some(bytes)) };
-        err.is_ok()
-            .then_some(())
-            .ok_or_else(|| std::io::Error::other(format!("레지스트리 쓰기 실패: {err:?}")))
-    } else {
-        let err = unsafe { RegDeleteValueW(key, PCWSTR(name.as_ptr())) };
-        // Deleting an absent value is fine.
-        if err.is_ok() || err.0 == 2 {
+    remove_legacy_run_value();
+    if enabled {
+        let action = format!("\"{}\" --minimized", exe_path());
+        let (ok, text) = schtasks(&[
+            "/Create", "/F",
+            "/TN", TASK_NAME,
+            "/SC", "ONLOGON",
+            "/RL", "HIGHEST",
+            "/TR", &action,
+        ])?;
+        if ok {
+            applog::write(format!("자동 실행 등록 (작업 스케줄러): {action}"));
             Ok(())
         } else {
-            Err(std::io::Error::other(format!("레지스트리 삭제 실패: {err:?}")))
+            applog::write(format!("자동 실행 등록 실패: {text}"));
+            Err(std::io::Error::other(format!(
+                "작업 스케줄러 등록 실패 (관리자 권한 필요): {text}"
+            )))
         }
-    };
-    unsafe {
-        let _ = RegCloseKey(key);
+    } else {
+        let (ok, text) = schtasks(&["/Delete", "/F", "/TN", TASK_NAME])?;
+        // 없는 작업을 지우는 것은 성공으로 본다.
+        if ok || !is_enabled() {
+            applog::write("자동 실행 해제 (작업 스케줄러)");
+            Ok(())
+        } else {
+            applog::write(format!("자동 실행 해제 실패: {text}"));
+            Err(std::io::Error::other(format!("작업 스케줄러 삭제 실패: {text}")))
+        }
     }
-    result
+}
+
+/// 예전 버전의 레지스트리 Run 항목 제거 (없으면 아무 일도 하지 않음).
+fn remove_legacy_run_value() {
+    let sub: Vec<u16> = LEGACY_RUN_KEY.encode_utf16().chain(std::iter::once(0)).collect();
+    let name: Vec<u16> = LEGACY_VALUE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(sub.as_ptr()), 0, KEY_SET_VALUE, &mut key).is_ok() {
+            if RegDeleteValueW(key, PCWSTR(name.as_ptr())).is_ok() {
+                applog::write("예전 레지스트리 Run 자동 실행 항목 제거");
+            }
+            let _ = RegCloseKey(key);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Writes to the real HKCU Run key and removes the value again.
+    /// 실제 작업 스케줄러에 등록했다 지운다. `/RL HIGHEST` 등록은 관리자 권한이
+    /// 필요하므로 일반 권한에서는 "미검증"으로 건너뛴다.
+    /// `cargo test -p kvm-server -- --ignored autostart`
     #[test]
-    #[ignore = "touches the real registry; run explicitly"]
+    #[ignore = "실제 작업 스케줄러를 변경"]
     fn roundtrip() {
         let was_enabled = is_enabled();
-        set(true).unwrap();
-        assert!(is_enabled());
-        set(false).unwrap();
-        assert!(!is_enabled());
-        // Leave the machine as we found it.
-        set(was_enabled).unwrap();
+        match set(true) {
+            Ok(()) => {
+                assert!(is_enabled(), "등록 후 조회 실패");
+                set(false).unwrap();
+                assert!(!is_enabled(), "해제 후에도 남아 있음");
+                set(was_enabled).unwrap();
+            }
+            Err(e) => {
+                eprintln!("미검증: 관리자 권한이 아니어서 등록 불가 — {e}");
+            }
+        }
     }
 }
