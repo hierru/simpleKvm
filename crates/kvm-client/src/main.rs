@@ -78,8 +78,15 @@ fn main() -> eframe::Result<()> {
             {
                 let q = queue.clone();
                 let ctx = cc.egui_ctx.clone();
+                // Quit is handled right here, not via the queue: while the window
+                // is hidden the egui loop may not tick, so a queued quit was never
+                // drained and the app could not be quit from the menu bar.
+                let quit_id = tray.as_ref().map(|t| t.quit_id.clone());
                 tray_icon::menu::MenuEvent::set_event_handler(Some(
                     move |ev: tray_icon::menu::MenuEvent| {
+                        if quit_id.as_ref() == Some(&ev.id) {
+                            std::process::exit(0);
+                        }
                         q.lock().unwrap().push(ev.id);
                         ctx.request_repaint();
                     },
